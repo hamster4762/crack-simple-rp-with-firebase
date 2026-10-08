@@ -2936,23 +2936,6 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       const elements = document.querySelectorAll('.__chat_input_textarea[contenteditable="true"], textarea[placeholder*="메시지"]');
       return Array.from(elements).find(element => element.getBoundingClientRect().height > 0) || null;
     }
-    sendButton() {
-      const composer = this.composer();
-      if (!composer) {
-        return null;
-      }
-      let node = composer.parentElement;
-      for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
-        // 실제 전송 버튼은 type 속성이 없다. 입력 영역 내부의 전송 아이콘으로 식별한다.
-        const buttons = Array.from(node.querySelectorAll('button')).filter(button =>
-          button.getBoundingClientRect().width > 0 &&
-          button.querySelector('svg path[d^="M18.77 11.13"]'));
-        if (buttons.length === 1) {
-          return buttons[0];
-        }
-      }
-      return null;
-    }
     preserveUnsentText(text) {
       const composer = this.composer();
       if (!composer) {
@@ -5613,19 +5596,21 @@ button[aria-pressed=true], .simplerp-active {
       return `<div class="simplerp-toolbar"><small class="simplerp-record-meta">${displayCount(characters)}자</small><div class="simplerp-actions">${iconButton('help', '기타 도움말', 'help', 'data-help="extras"')}${iconButton('item-add', '기타 추가', 'plus', 'data-kind="extras"')}</div></div><div class="simplerp-list">${room.extras.slice(0, this.visibleRows).map(item => this.record(item, 'extras')).join('') || '<p class="simplerp-empty">기타 없음</p>'}</div>${this.moreRows(room.extras.length)}`;
     }
     mountLauncher() {
-      const send = this.controller.adapter.sendButton();
-      const actions = send?.parentElement?.querySelector(':scope > div.flex.items-center.space-x-2');
-      if (!actions) {
+      // Crack 기본 단축어 버튼의 그룹에 추가한다. 간격 클래스·전송 아이콘·
+      // 다른 확프의 DOM을 기준으로 찾거나 전송 버튼 옆으로 우회하지 않는다.
+      const shortcut = document.querySelector('button[aria-label="단축어 패널 열기"]');
+      if (!shortcut) {
         return;
       }
-      this.launcherComposer = this.controller.adapter.composer();
+      const actions = shortcut.parentElement;
+      this.launcherShortcut = shortcut;
       if (!this.launcherHost) {
         this.launcherHost = document.createElement('span');
         this.launcherHost.id = 'simplerp-launcher';
         const shadow = this.launcherHost.attachShadow({
           mode: 'open'
         });
-        shadow.innerHTML = `<style>:host{display:inline-flex;margin-right:5px}button{width:30px;height:30px;border:1px solid #8d9dcc;border-radius:50%;background:#202b40;color:#b8c7f3;font:9px/1 system-ui;cursor:pointer}button[data-phase=ON]{color:#8fe0b6;border-color:#77c69c}button[data-phase=ERROR]{color:#ff9292;border-color:#ef8080;font-size:17px;font-weight:700}.spin{display:inline-block;width:13px;height:13px;border:2px solid #4b5874;border-top-color:#c9d6ff;border-radius:50%;animation:simplerp-wait .9s linear infinite}@keyframes simplerp-wait{to{transform:rotate(360deg)}}</style>
+        shadow.innerHTML = `<style>:host{display:inline-flex;flex-shrink:0}button{width:30px;height:30px;border:1px solid #8d9dcc;border-radius:50%;background:#202b40;color:#b8c7f3;font:9px/1 system-ui;cursor:pointer}button[data-phase=ON]{color:#8fe0b6;border-color:#77c69c}button[data-phase=ERROR]{color:#ff9292;border-color:#ef8080;font-size:17px;font-weight:700}.spin{display:inline-block;width:13px;height:13px;border:2px solid #4b5874;border-top-color:#c9d6ff;border-radius:50%;animation:simplerp-wait .9s linear infinite}@keyframes simplerp-wait{to{transform:rotate(360deg)}}</style>
           <button type="button" aria-label="SimpleRP · 주입 확인 중"><span class="spin"></span></button>`;
         shadow.querySelector('button').addEventListener('click', () => this.run(() => this.open()));
       }
@@ -7351,17 +7336,9 @@ button[aria-pressed=true], .simplerp-active {
         report(error);
       } finally {
         routeCheckBusy = false;
-        if (!ui.launcherHost?.isConnected) {
-          ui.mountLauncher();
-        }
       }
     };
     ui.onRouteMismatch = checkRoute;
-    ui.mountLauncher();
-    await checkRoute();
-    if (startupError) {
-      ui.showNotice(startupError, true);
-    }
     let domTimer;
     let observedRouteUrl = location.href;
     const observer = new MutationObserver(mutations => {
@@ -7370,14 +7347,14 @@ button[aria-pressed=true], .simplerp-active {
         observedRouteUrl = location.href;
         void checkRoute();
       }
-      // 재부착 예약 중에는 같은 DOM 검색을 반복하지 않는다. 기존 입력창이
-      // 남아 있는 상태에서 새 입력창이 추가되는 경우도 계속 감지한다.
-      const needsMount = !ui.launcherHost?.isConnected || !ui.launcherComposer?.isConnected;
-      const newComposer = !domTimer && !needsMount && mutations.some(mutation =>
+      // 기본 단축어 버튼이 추가되거나, 그 그룹에서 진입점만 제거됐을 때 재부착.
+      // 단축어가 없는 화면의 다른 DOM 변경에는 부착 검색을 반복하지 않는다.
+      const launcherRemoved = ui.launcherShortcut?.isConnected && ui.launcherHost && !ui.launcherHost.isConnected;
+      const shortcutAdded = !domTimer && mutations.some(mutation =>
         mutation.type === 'childList' && Array.from(mutation.addedNodes).some(node =>
           node.nodeType === Node.ELEMENT_NODE && node !== ui.host && node !== ui.launcherHost &&
-          (node.matches('.__chat_input_textarea[contenteditable="true"]') || node.querySelector('.__chat_input_textarea[contenteditable="true"]'))));
-      if (!domTimer && (needsMount || newComposer)) {
+          (node.matches('button[aria-label="단축어 패널 열기"]') || node.querySelector('button[aria-label="단축어 패널 열기"]'))));
+      if (!domTimer && (launcherRemoved || shortcutAdded)) {
         domTimer = setTimeout(() => {
           domTimer = null;
           ui.mountLauncher();
@@ -7389,7 +7366,13 @@ button[aria-pressed=true], .simplerp-active {
       subtree: true,
       characterData: true
     });
+    // 서버 초기 조회를 기다리기 전에 감시·부착을 시작해 늦게 생성되는 입력창도 잡는다.
+    ui.mountLauncher();
     hideRenderedMemory(document.body);
+    await checkRoute();
+    if (startupError) {
+      ui.showNotice(startupError, true);
+    }
     // 이 타이머는 로컬 URL/계정 식별만 확인한다. 같은 방에서는 서버 조회 없음.
     // 메시지 갱신은 완료·편집·삭제 이벤트와 사용자 조작으로만 수행한다.
     setInterval(() => void checkRoute(), 5000);
