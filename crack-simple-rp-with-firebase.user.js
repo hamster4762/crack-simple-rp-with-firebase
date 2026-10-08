@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      1.0.0.0
+// @version      1.0.0.1
 // @description  수동 기억 구축·검토·저장과 RP 연속성 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -1417,21 +1417,39 @@ A → B 관계는 A가 B를 향한 의미·태도이며 B의 감정/인지를 �
   async function buildDiff(before, after, includeExtras) {
     const stateBefore = before.memory.currentState.body;
     const stateAfter = after.memory.currentState.body;
-    const result = {
-      state: equal(stateBefore, stateAfter) ? [] : !stateBefore.trim()
-        ? parseStateSections(stateAfter).map(section => ({
-          type: 'add',
-          kind: 'state',
+    // 비교용 ID만 만든다. 앞 항목 길이·번호가 바뀌어도 제목으로 연결하며,
+    // 같은 제목은 등장 순서로 구별한다. 저장 원문과 스키마는 변경하지 않는다.
+    const stateRows = body => {
+      const occurrences = new Map();
+      return parseStateSections(body).map(section => {
+        const occurrence = (occurrences.get(section.title) || 0) + 1;
+        occurrences.set(section.title, occurrence);
+        return {
+          id: JSON.stringify([section.title, occurrence]),
           title: section.title,
-          before: null,
-          after: section.body
-        })) : [{
-        type: !stateBefore ? 'add' : !stateAfter ? 'delete' : 'modify',
-        kind: 'state',
-        title: '현재상태 원문',
-        before: stateBefore,
-        after: stateAfter
-      }],
+          body: section.body
+        };
+      });
+    };
+    const previousSections = stateRows(stateBefore);
+    const nextSections = stateRows(stateAfter);
+    // 추가·삭제로 밀린 순번은 변경으로 세지 않고, 공통 섹션의 실제 순서만 비교한다.
+    const previousIds = new Set(previousSections.map(section => section.id));
+    const nextPositions = new Map(nextSections.filter(section => previousIds.has(section.id)).map((section, index) => [section.id, index]));
+    const previousPositions = new Map(previousSections.filter(section => nextPositions.has(section.id)).map((section, index) => [section.id, index]));
+    const stateChanges = (await diffItems(previousSections, nextSections, before, after, 'state')).filter(change => {
+      if (change.type !== 'modify') {
+        return true;
+      }
+      change.moved = previousPositions.get(change.before.id) !== nextPositions.get(change.after.id);
+      return change.moved || !equal(change.before, change.after);
+    });
+    const result = {
+      state: stateChanges.map(change => ({
+        ...change,
+        before: change.before?.body ?? null,
+        after: change.after?.body ?? null
+      })),
       dateLogs: await diffItems(before.memory.dateLogs, after.memory.dateLogs, before, after, 'dateLogs'),
       people: [],
       lore: await diffItems(before.memory.lore, after.memory.lore, before, after, 'lore')
@@ -4865,6 +4883,14 @@ button[aria-pressed=true], .simplerp-active {
 .simplerp-diff-detail {
     padding: 6px 2px 12px;
 }
+.simplerp-diff-text {
+    margin: 5px 0 0;
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: inherit;
+    line-height: 1.6;
+}
 @media (max-width:340px) {
     .simplerp-toolbar .simplerp-actions {
         gap: 0;
@@ -6286,7 +6312,6 @@ button[aria-pressed=true], .simplerp-active {
     openDiff(review, closeInput) {
       let active = 'state';
       let visibleChanges = 100;
-      let views = [];
       let context;
       context = this.modal('변경사항', '', [['취소', () => this.closeModal(context)], ['적용', async () => {
         if (!equal(this.controller.draft, review.before)) {
@@ -6304,8 +6329,6 @@ button[aria-pressed=true], .simplerp-active {
         await closeInput();
       }, true]]);
       const paint = () => {
-        views.forEach(view => view.dispose());
-        views = [];
         const groups = Object.keys(review.diff);
         context.body.innerHTML = `<div class="simplerp-guide-tabs" style="grid-template-columns:repeat(${groups.length},minmax(0,1fr))">${groups.map(key => `<button type="button" data-diff-tab="${key}" aria-pressed="${key === active}">${html({
           state: '상태',
@@ -6334,7 +6357,9 @@ button[aria-pressed=true], .simplerp-active {
           details.dataset.mounted = 'true';
           const change = review.diff[active][Number(details.dataset.diffRow)];
           const fields = details.querySelector('.simplerp-diff-detail');
-          fields.innerHTML = '<div class="simplerp-view-pair"><div><small>변경 전</small><div data-before></div></div><div><small>변경 후</small><div data-after></div></div></div>';
+          // 펼친 항목만 표시한다. diff에는 검색·행 이동·줄번호가 필요 없으며,
+          // 긴 줄도 화면 너비에 맞춰 줄바꿈한다. 원문 뷰어에는 영향 없음.
+          fields.innerHTML = '<div class="simplerp-view-pair"><div><small>변경 전</small><pre class="simplerp-diff-text" data-before></pre></div><div><small>변경 후</small><pre class="simplerp-diff-text" data-after></pre></div></div>';
           for (const side of ['before', 'after']) {
             const value = change[side];
             let source = '없음';
@@ -6342,12 +6367,11 @@ button[aria-pressed=true], .simplerp-active {
               source = typeof value === 'string' ? value : await JsonWork.run('stringify', this.readableDiffValue(value, side === 'before' ? review.before : review.after));
             }
             if (fields.isConnected) {
-              views.push(new VirtualTextView(fields.querySelector(`[data-${side}]`), source));
+              fields.querySelector(`[data-${side}]`).textContent = source;
             }
           }
         }));
       };
-      context.cleanups.push(() => views.forEach(view => view.dispose()));
       paint();
     }
     readableDiffValue(value, room) {
