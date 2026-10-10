@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      1.0.0.1
+// @version      1.0.0.2
 // @description  수동 기억 구축·검토·저장과 RP 연속성 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -45,7 +45,7 @@
  *    │  ├─ meta: 아래 채팅방 meta와 동일
  *    │  └─ data: { lastBuild, memory, extras, selection }의 JSON 문자열
  *    └─ settings
- *       ├─ updatedAt: 서버 저장시각 (Unix epoch 밀리초)
+ *       ├─ updatedAt: 기기에서 생성한 저장시각 (Unix epoch 밀리초)
  *       └─ data: { customGuides, guideModes }의 JSON 문자열
  *
  * 채팅방 논리 구조 (IndexedDB 원본 / Firebase 문자열 해석 후 구조)
@@ -2191,15 +2191,10 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
 
   // RTDB는 빈 배열/객체를 삭제하므로 데이터 본문은 JSON 문자열로 보존한다.
   // meta만 별도 노드: 목록에서 큰 기억 본문을 다운로드하지 않아도 이름/시각 조회 가능.
-  function encodeFirebaseRoom(room, serverTime = false) {
+  function encodeFirebaseRoom(room) {
     return {
       schemaVersion: SCHEMA_VERSION,
-      meta: {
-        ...clone(room.meta),
-        updatedAt: serverTime ? {
-          '.sv': 'timestamp'
-        } : room.meta.updatedAt
-      },
+      meta: clone(room.meta),
       data: JSON.stringify({
         lastBuild: room.lastBuild,
         memory: room.memory,
@@ -2227,11 +2222,9 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
     await new SchemaValidator().room(room);
     return room;
   }
-  function encodeFirebaseSettings(settings, serverTime = false) {
+  function encodeFirebaseSettings(settings) {
     return {
-      updatedAt: serverTime ? {
-        '.sv': 'timestamp'
-      } : settings.updatedAt,
+      updatedAt: settings.updatedAt,
       data: JSON.stringify({
         customGuides: settings.customGuides,
         guideModes: settings.guideModes
@@ -2471,55 +2464,50 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
           throw error;
         }
         const observed = await this.request('GET', path);
-        // 서버 timestamp를 포함한 쓰기는 상위 save/replace에서 본문 비교로 판정한다.
+        // 전체 교체·삭제의 응답 유실 처리는 각 작업에서 판정한다.
         throw new SimpleRPError('저장 응답을 받지 못했습니다. 서버 최신본을 확인하세요. 자동 재전송하지 않습니다.', {
           code: 'UNCERTAIN_WRITE',
           observed: observed.data
         });
       }
     }
+    // 일반 저장의 충돌 확인에는 본문이나 방 전체 ETag가 필요 없다.
+    async readUpdatedAt(path) {
+      const result = await this.request('GET', path);
+      const updatedAt = result.data ?? 0;
+      try {
+        new SchemaValidator().number(updatedAt, path);
+        return updatedAt;
+      } catch (error) {
+        throw storageDataError(this, error, path, undefined);
+      }
+    }
     async saveRoom(room, expectedUpdatedAt, overwrite = false) {
       await this.assertWriteAllowed();
       await new SchemaValidator().room(room);
       const path = `${this.root}/rooms/${room.meta.roomKey}`;
-      const before = await this.request('GET', path);
-      if (!overwrite && (before.data?.meta.updatedAt || 0) !== expectedUpdatedAt) {
+      const currentUpdatedAt = await this.readUpdatedAt(`${path}/meta/updatedAt`);
+      if (!overwrite && currentUpdatedAt !== expectedUpdatedAt) {
         throw new ConflictError();
       }
-      const wire = encodeFirebaseRoom(room, true);
-      try {
-        await this.conditionalWrite(path, wire, before.etag, overwrite);
-      } catch (error) {
-        if (error.code !== 'UNCERTAIN_WRITE' || error.observed?.data !== wire.data || error.observed?.meta?.name !== room.meta.name) {
-          throw error;
-        }
-      }
-      const saved = await this.readRoom(room.meta.roomKey);
-      if (!saved || !equal(saved.memory, room.memory) || !equal(saved.extras, room.extras) || !equal(saved.selection, room.selection) || !equal(saved.lastBuild, room.lastBuild) || saved.meta.name !== room.meta.name || saved.meta.chatId !== room.meta.chatId) {
-        throw new SimpleRPError('Firebase 저장 후 원문 확인에 실패했습니다. 편집본을 유지합니다.');
-      }
+      const saved = clone(room);
+      saved.meta.updatedAt = nextTimestamp(Math.max(expectedUpdatedAt, currentUpdatedAt));
+      // 성공 응답만 확인한다. 본문 응답·사후 GET·응답 유실 시 자동 재조회 없음.
+      // 실패하면 호출자가 기존 캐시와 draft를 유지한다.
+      await this.request('PUT', path, encodeFirebaseRoom(saved), undefined, { print: 'silent' });
       return saved;
     }
     async saveSettings(settings, expectedUpdatedAt, overwrite = false) {
       await this.assertWriteAllowed();
       new SchemaValidator().settings(settings);
       const path = `${this.root}/settings`;
-      const before = await this.request('GET', path);
-      if (!overwrite && (before.data?.updatedAt || 0) !== expectedUpdatedAt) {
+      const currentUpdatedAt = await this.readUpdatedAt(`${path}/updatedAt`);
+      if (!overwrite && currentUpdatedAt !== expectedUpdatedAt) {
         throw new ConflictError();
       }
-      const wire = encodeFirebaseSettings(settings, true);
-      try {
-        await this.conditionalWrite(path, wire, before.etag, overwrite);
-      } catch (error) {
-        if (error.code !== 'UNCERTAIN_WRITE' || error.observed?.data !== wire.data) {
-          throw error;
-        }
-      }
-      const saved = await this.readSettings();
-      if (!equal(saved.customGuides, settings.customGuides) || !equal(saved.guideModes, settings.guideModes)) {
-        throw new SimpleRPError('Firebase 지침 저장 결과가 다릅니다.');
-      }
+      const saved = clone(settings);
+      saved.updatedAt = nextTimestamp(Math.max(expectedUpdatedAt, currentUpdatedAt));
+      await this.request('PUT', path, encodeFirebaseSettings(saved), undefined, { print: 'silent' });
       return saved;
     }
     async deleteRoom(key, expectedUpdatedAt) {
@@ -2543,10 +2531,18 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
     async replace(snapshot, expectedEtag, refreshTimes = false, overwrite = false) {
       await this.assertWriteAllowed();
       await new SchemaValidator().snapshot(snapshot);
+      // 전체 복원·저장소 복사도 로컬과 같은 기기 시각 함수를 사용한다.
+      const replacement = clone(snapshot);
+      if (refreshTimes) {
+        for (const room of Object.values(replacement.rooms)) {
+          room.meta.updatedAt = nextTimestamp(room.meta.updatedAt);
+        }
+        replacement.settings.updatedAt = nextTimestamp(replacement.settings.updatedAt);
+      }
       const wire = {
         schemaVersion: SCHEMA_VERSION,
-        rooms: Object.fromEntries(Object.entries(snapshot.rooms).map(([key, room]) => [key, encodeFirebaseRoom(room, refreshTimes)])),
-        settings: encodeFirebaseSettings(snapshot.settings, refreshTimes)
+        rooms: Object.fromEntries(Object.entries(replacement.rooms).map(([key, room]) => [key, encodeFirebaseRoom(room)])),
+        settings: encodeFirebaseSettings(replacement.settings)
       };
       // /simpleRP만 교체. 프로젝트 루트나 다른 앱의 데이터는 건드리지 않는다.
       try {
@@ -2558,18 +2554,10 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         // 응답이 유실된 쓰기는 아래 전체 재조회/본문 비교로만 성공 판정한다.
       }
       const verified = await this.snapshot();
-      const expected = clone(snapshot);
-      const actual = clone(verified.snapshot);
-      for (const [key, room] of Object.entries(expected.rooms)) {
-        if (actual.rooms[key]) {
-          room.meta.updatedAt = actual.rooms[key].meta.updatedAt;
-        }
-      }
-      expected.settings.updatedAt = actual.settings.updatedAt;
-      if (!equal(expected, actual)) {
+      if (!equal(replacement, verified.snapshot)) {
         throw new SimpleRPError('Firebase 전체 교체 후 검증 실패. 추가 삭제/롤백하지 않습니다. 서버 최신본을 확인하세요.');
       }
-      return actual;
+      return verified.snapshot;
     }
   }
   function firebaseRules(uid) {
@@ -3931,16 +3919,11 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       await new SchemaValidator().packet(packet);
       const request = this.requestCache;
       const before = clone(this.draft);
-      const repository = this.repository;
       const baseUpdatedAt = this.draftBase.meta.updatedAt;
-      const latest = await repository.readRoom(before.meta.roomKey);
-      if (repository !== this.repository || !equal(before, this.draft)) {
-        throw new SimpleRPError('JSON 검사 중 편집본 또는 저장소가 바뀌었습니다. 다시 검사하세요.');
-      }
+      // JSON 검사는 표시 중인 draft와 캐시의 기준 시각만 사용한다.
       // 다른 방 복사용 JSON의 출처 시각은 대상 방과 비교하지 않는다.
-      const staleSource = (latest?.meta.updatedAt || 0) !== baseUpdatedAt ||
-        !Object.hasOwn(packet, 'extras') && (packet.sourceUpdatedAt !== (latest?.meta.updatedAt || 0) ||
-          request?.identity.roomKey === before.meta.roomKey && packet.lastTurn !== request.source.lastTurn);
+      const staleSource = !Object.hasOwn(packet, 'extras') && (packet.sourceUpdatedAt !== baseUpdatedAt ||
+        request?.identity.roomKey === before.meta.roomKey && packet.lastTurn !== request.source.lastTurn);
       const after = applyMemoryPacket(before, packet);
       await new SchemaValidator().room(after);
       return {
