@@ -3136,13 +3136,14 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       this.recentTurns = [];
       this.recentMessages = [];
       this.messageChangeSequence = 0;
+      // 최근 메시지를 확인한 변경 번호. 이벤트 이후의 오래된 캐시와 빈 유효 캐시도 구별한다.
+      this.recentMessagesSequence = -1;
       this.turnCountCache = null;
       this.preview = null;
       this.requestCache = null;
       this.lastHead = '';
       this.polling = false;
       this.refreshAgain = false;
-      this.carrierScanComplete = false;
       this.knownCarrierIds = new Set();
       this.ui = null;
       // 메시지 소속 ID는 분기에서 달라질 수 있다. 이벤트는 재조회 신호일 뿐이며
@@ -3223,7 +3224,6 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       this.messageChangeSequence += 1;
       this.requestCache = null;
       this.lastHead = '';
-      this.carrierScanComplete = false;
       this.knownCarrierIds.clear();
       this.injection = {
         phase: 'PENDING',
@@ -3394,13 +3394,20 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       this.settingsDraft = clone(saved);
       return true;
     }
-    async refreshCurrent(recover = false) {
+    async refreshCurrent(recover = false, onlyIfNeeded = false) {
       if (!this.identity || this.loadingCurrent || this.injection.blocked || this.injection.phase === 'ERROR' && !this.currentRoomCache) {
+        return;
+      }
+      // 메뉴 조회만 캐시를 재사용한다. 이벤트 갱신·생성/오류 재확인·전송 준비는 생략하지 않는다.
+      if (onlyIfNeeded && !recover && !this.adapter.generation && !this.injection.error &&
+          this.recentMessagesSequence === this.messageChangeSequence) {
         return;
       }
       if (this.polling) {
         // 처리 중 도착한 변경 신호는 버리지 않고 완료 후 한 번만 재확인한다.
-        this.refreshAgain = true;
+        if (!onlyIfNeeded) {
+          this.refreshAgain = true;
+        }
         return;
       }
       this.polling = true;
@@ -3421,6 +3428,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
           assertInjectionNotNewer(head, this.currentRoomCache.meta.updatedAt);
         }
         this.recentMessages = sequence === this.messageChangeSequence ? head : [];
+        this.recentMessagesSequence = sequence;
         if (sequence === this.messageChangeSequence) {
           this.updateTurnCount(head);
         }
@@ -3567,14 +3575,6 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             ? reusableObserved.head : await this.adapter.recent(identity);
           assertActive();
           assertInjectionNotNewer(head, saved.meta.updatedAt);
-          if (!this.carrierScanComplete) {
-            // 최초 1회 전체 기록을 확인하여 최근 범위 밖의 잔존 블록을 찾는다.
-            const history = await this.adapter.readHistory(identity, assertActive);
-            assertActive();
-            assertInjectionNotNewer(history, saved.meta.updatedAt);
-            history.filter(message => stripOwnBlock(message.text).found).forEach(message => this.knownCarrierIds.add(message.id));
-            this.carrierScanComplete = true;
-          }
           const carrier = selectCarrier(head);
           if (!carrier) {
             throw new SimpleRPError('주입할 AI 메시지가 없습니다. AI 응답이 완료된 뒤 다시 시작하세요.');
@@ -3636,6 +3636,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             ...message,
             text: confirmedTexts.get(message.id) ?? message.text
           })) : [];
+          this.recentMessagesSequence = headSequence;
           if (headSequence === this.messageChangeSequence) {
             this.updateTurnCount(head);
           }
@@ -3699,7 +3700,8 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             error: ''
           };
           this.knownCarrierIds.clear();
-          this.carrierScanComplete = true;
+          // 해제로 서버 원문이 바뀌었으므로 이전 주입이 담긴 문맥 캐시는 재사용하지 않는다.
+          this.recentMessagesSequence = -1;
         } catch (error) {
           if (epoch === this.routeEpoch && !this.blockNewerInjection(error)) {
             this.injection.phase = 'OFF';
@@ -5267,7 +5269,7 @@ button[aria-pressed=true], .simplerp-active {
       }
       this.render();
       if (this.controller.currentRoomCache) {
-        this.run(() => this.controller.refreshCurrent(Boolean(this.controller.injection.unknown)), true);
+        this.run(() => this.controller.refreshCurrent(Boolean(this.controller.injection.unknown), true), true);
       }
     }
     async allowDiscardDraft() {
@@ -5659,7 +5661,7 @@ button[aria-pressed=true], .simplerp-active {
           this.visibleRows = 100;
           this.render();
           if (this.currentTab === 'home' && controller.showingCurrentRoom && controller.currentRoomCache) {
-            await controller.refreshCurrent(Boolean(controller.injection.unknown));
+            await controller.refreshCurrent(Boolean(controller.injection.unknown), true);
           }
           return;
         case 'people-tab':
