@@ -1363,6 +1363,140 @@ A → B 관계는 A가 B를 향한 의미·태도이며 B의 감정/인지를 �
       context
     };
   }
+  // 어절과 공백을 보존한다. 한쪽에만 있는 토큰은 비교 탐색에서 제외하고,
+  // 공백만 같은 곳에서 변경문을 끊지 않는다. 공통 어절 사이의 변경 구간은
+  // 삭제문·추가문을 각각 묶으며 원문의 공백/줄바꿈은 그대로 보존한다.
+  async function diffWords(before, after, isActive = () => true) {
+    if (before === after) {
+      return [{ type: 'equal', text: before }];
+    }
+    const oldTokens = before.match(/\s+|\S+/gu) || [];
+    const newTokens = after.match(/\s+|\S+/gu) || [];
+    const oldSet = new Set(oldTokens);
+    const newSet = new Set(newTokens);
+    const left = oldTokens.map((text, index) => ({ text, index })).filter(token => token.text.trim() && newSet.has(token.text));
+    const right = newTokens.map((text, index) => ({ text, index })).filter(token => token.text.trim() && oldSet.has(token.text));
+    const matches = [];
+    let work = 0;
+    let lastYield = Date.now();
+    async function yieldIfNeeded() {
+      if (Date.now() - lastYield >= 8) {
+        await wait(0);
+        lastYield = Date.now();
+      }
+      return isActive();
+    }
+    async function split(a0, a1, b0, b1) {
+      const n = a1 - a0;
+      const m = b1 - b0;
+      const depth = Math.ceil((n + m) / 2);
+      const offset = depth + 1;
+      const forward = new Int32Array(2 * depth + 3).fill(-1);
+      const reverse = new Int32Array(2 * depth + 3).fill(-1);
+      forward[offset + 1] = reverse[offset + 1] = 0;
+      const delta = n - m;
+      for (let distance = 0; distance <= depth; distance += 1) {
+        for (const backwards of [false, true]) {
+          const path = backwards ? reverse : forward;
+          for (let diagonal = -distance; diagonal <= distance; diagonal += 2) {
+            if (++work % 8192 === 0 && !(await yieldIfNeeded())) {
+              return null;
+            }
+            const position = offset + diagonal;
+            let x = diagonal === -distance || diagonal !== distance && path[position - 1] < path[position + 1]
+              ? path[position + 1] : path[position - 1] + 1;
+            let y = x - diagonal;
+            while (x < n && y < m && (backwards
+              ? left[a1 - x - 1].text === right[b1 - y - 1].text
+              : left[a0 + x].text === right[b0 + y].text)) {
+              x += 1;
+              y += 1;
+              if (++work % 8192 === 0 && !(await yieldIfNeeded())) {
+                return null;
+              }
+            }
+            path[position] = x;
+            const opposite = offset + delta - diagonal;
+            if (opposite < 0 || opposite >= path.length) {
+              continue;
+            }
+            if (!backwards && delta % 2 !== 0 && reverse[opposite] >= 0 && x >= n - reverse[opposite]) {
+              return [a0 + x, b0 + y];
+            }
+            if (backwards && delta % 2 === 0 && forward[opposite] >= 0 && forward[opposite] >= n - x) {
+              return [a0 + forward[opposite], b0 + forward[opposite] - (delta - diagonal)];
+            }
+          }
+        }
+      }
+      return null;
+    }
+    async function compare(a0, a1, b0, b1) {
+      if (!isActive()) {
+        return;
+      }
+      while (a0 < a1 && b0 < b1 && left[a0].text === right[b0].text) {
+        matches.push([left[a0++].index, right[b0++].index]);
+        if (++work % 8192 === 0 && !(await yieldIfNeeded())) {
+          return;
+        }
+      }
+      let suffix = 0;
+      while (a0 < a1 - suffix && b0 < b1 - suffix && left[a1 - suffix - 1].text === right[b1 - suffix - 1].text) {
+        suffix += 1;
+        if (++work % 8192 === 0 && !(await yieldIfNeeded())) {
+          return;
+        }
+      }
+      const endA = a1 - suffix;
+      const endB = b1 - suffix;
+      if (a0 < endA && b0 < endB) {
+        const middle = await split(a0, endA, b0, endB);
+        if (middle && !(middle[0] === a0 && middle[1] === b0) && !(middle[0] === endA && middle[1] === endB)) {
+          await compare(a0, middle[0], b0, middle[1]);
+          await compare(middle[0], endA, middle[1], endB);
+        }
+      }
+      for (let index = 0; index < suffix; index += 1) {
+        matches.push([left[endA + index].index, right[endB + index].index]);
+      }
+    }
+    await compare(0, left.length, 0, right.length);
+    if (!isActive()) {
+      return [];
+    }
+    const output = [];
+    const append = (type, text) => {
+      if (!text) {
+        return;
+      }
+      if (output.at(-1)?.type === type) {
+        output.at(-1).text += text;
+      } else {
+        output.push({ type, text });
+      }
+    };
+    let oldPosition = 0;
+    let newPosition = 0;
+    matches.push([oldTokens.length, newTokens.length]);
+    for (const [oldIndex, newIndex] of matches) {
+      if (++work % 8192 === 0 && !(await yieldIfNeeded())) {
+        return [];
+      }
+      const oldGap = oldTokens.slice(oldPosition, oldIndex).join('');
+      const newGap = newTokens.slice(newPosition, newIndex).join('');
+      if (oldGap === newGap) {
+        append('equal', oldGap);
+      } else {
+        append('delete', oldGap);
+        append('add', newGap);
+      }
+      append('equal', oldTokens[oldIndex] || '');
+      oldPosition = oldIndex + 1;
+      newPosition = newIndex + 1;
+    }
+    return output;
+  }
   async function diffItems(before, after, roomBefore, roomAfter, kind) {
     const oldMap = new Map(before.map((item, index) => [item.id, {
       item,
@@ -5030,6 +5164,22 @@ button[aria-pressed=true], .simplerp-active {
     font: inherit;
     line-height: 1.6;
 }
+.simplerp-diff-detail del {
+    background: #68333e;
+    color: #ffd2d9;
+    text-decoration: line-through;
+}
+.simplerp-diff-detail ins {
+    background: #234e3b;
+    color: #bcf2d3;
+    text-decoration: none;
+}
+.simplerp-diff-detail .simplerp-knowledge-chip {
+    display: inline-block;
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
 @media (max-width:340px) {
     .simplerp-toolbar .simplerp-actions {
         gap: 0;
@@ -5273,8 +5423,6 @@ button[aria-pressed=true], .simplerp-active {
                 .simplerp-virtual-space { position: relative; }
                 .simplerp-virtual-line { position: absolute; height: 22px; white-space: pre; font: 12px/22px Consolas, monospace; }
                 .simplerp-line-number { display: inline-block; width: 55px; color: var(--simplerp-muted); text-align: right; padding-right: 9px; }
-                .simplerp-view-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-                .simplerp-view-pair > div { min-width: 0; }
                 .simplerp-nested-row { border-top: 1px solid var(--simplerp-line); padding-top: 7px; margin-top: 7px; }
                 .simplerp-room-row { display:flex; align-items:center; gap:6px; border-bottom:1px solid var(--simplerp-line); }
                 .simplerp-room-row > button[data-room-select] { flex:1; min-width:0; display:flex; flex-direction:column; align-items:flex-start; text-align:left; border:0; border-radius:0; background:transparent; padding:9px 3px; }
@@ -5328,7 +5476,7 @@ button[aria-pressed=true], .simplerp-active {
                 .simplerp-busy { color: var(--simplerp-muted); padding: 12px 0; }
                 @keyframes simplerp-wait { to { transform: rotate(360deg); } }
                 .simplerp-spinner { display: inline-block; width: 17px; height: 17px; border: 2px solid #526480; border-top-color: #b2c0ef; border-radius: 50%; animation: simplerp-wait .9s linear infinite; }
-                @media(max-width:650px) { .simplerp-app { height: calc(100dvh - 16px); width: calc(100vw - 12px); } .simplerp-body { padding: 9px; } .simplerp-view-pair { grid-template-columns: 1fr; } }
+                @media(max-width:650px) { .simplerp-app { height: calc(100dvh - 16px); width: calc(100vw - 12px); } .simplerp-body { padding: 9px; } }
             `;
       this.main = document.createElement('dialog');
       this.main.className = 'simplerp-app';
@@ -6491,50 +6639,184 @@ button[aria-pressed=true], .simplerp-active {
           visibleChanges = 100;
           paint();
         }));
-        context.body.querySelectorAll('[data-diff-row]').forEach(details => details.addEventListener('toggle', async () => {
-          if (!details.open || details.dataset.mounted) {
-            return;
-          }
-          details.dataset.mounted = 'true';
+        context.body.querySelectorAll('[data-diff-row]').forEach(details => {
           const change = review.diff[active][Number(details.dataset.diffRow)];
-          const fields = details.querySelector('.simplerp-diff-detail');
-          // 펼친 항목만 표시한다. diff에는 검색·행 이동·줄번호가 필요 없으며,
-          // 긴 줄도 화면 너비에 맞춰 줄바꿈한다. 원문 뷰어에는 영향 없음.
-          fields.innerHTML = '<div class="simplerp-view-pair"><div><small>변경 전</small><pre class="simplerp-diff-text" data-before></pre></div><div><small>변경 후</small><pre class="simplerp-diff-text" data-after></pre></div></div>';
-          for (const side of ['before', 'after']) {
-            const value = change[side];
-            let source = '없음';
-            if (value !== null) {
-              source = typeof value === 'string' ? value : await JsonWork.run('stringify', this.readableDiffValue(value, side === 'before' ? review.before : review.after));
+          let renderVersion = 0;
+          details.addEventListener('toggle', () => {
+            const version = ++renderVersion;
+            if (!details.open || details.dataset.mounted || !details.isConnected) {
+              return;
             }
-            if (fields.isConnected) {
-              fields.querySelector(`[data-${side}]`).textContent = source;
-            }
-          }
-        }));
+            const fields = details.querySelector('.simplerp-diff-detail');
+            const isActive = () => context.dialog.open && details.isConnected && details.open && version === renderVersion;
+            fields.textContent = '비교 중…';
+            // 펼친 항목만 계산한다. 닫기·탭 전환으로 폐기된 작업은 결과를 붙이지 않는다.
+            void this.run(async () => {
+              const markup = await this.renderDiffFields(
+                this.diffFields(change.before, review.before, change.kind),
+                this.diffFields(change.after, review.after, change.kind),
+                change.type === 'modify', isActive
+              );
+              if (isActive()) {
+                fields.innerHTML = markup;
+                details.dataset.mounted = 'true';
+              }
+            });
+          });
+        });
       };
       paint();
     }
-    readableDiffValue(value, room) {
-      const output = clone(value);
-      const walk = object => {
-        if (!object || typeof object !== 'object') {
-          return;
+    // 표시 전용 필드. 원본/적용본과 분리하며 저장 스키마·주입 formatter는 바꾸지 않는다.
+    diffFields(item, room, kind) {
+      if (item === null) {
+        return [];
+      }
+      const field = (key, label, value, atomic = false) => ({ key, label, value: value || '', atomic });
+      const chips = (key, label, values) => {
+        const occurrences = new Map();
+        return { key, label, type: 'chips', rows: values.map(value => {
+          const number = (occurrences.get(value) || 0) + 1;
+          occurrences.set(value, number);
+          return { key: JSON.stringify([value, number]), value };
+        }) };
+      };
+      const person = (key, label, id) => field(key, label, actorName(room, id), true);
+      switch (kind) {
+        case 'state':
+          return [field('body', '내용', item)];
+        case 'actors':
+          return [
+            field('name', '이름', item.name),
+            chips('aliases', '별칭', item.aliases),
+            field('isPlayer', 'PC 여부', item.isPlayer ? 'PC' : 'PC 아님', true)
+          ];
+        case 'dateLogs':
+          return [
+            field('date', '날짜', item.date.display, true),
+            field('title', '제목', item.title),
+            field('summary', '내용', item.summary)
+          ];
+        case 'lore':
+          return [
+            field('name', '이름', item.name), field('type', '종류', item.type, true),
+            chips('triggers', '감지어', item.triggers),
+            field('full', '전체 내용', item.content.full)
+          ];
+        case 'extras':
+          return [
+            field('title', '제목', item.title),
+            chips('triggers', '감지어', item.triggers), field('body', '내용', item.body)
+          ];
+        case 'speech':
+          return [
+            person('speaker', '화자', item.speakerId), person('target', '상대', item.targetId),
+            field('address', '호칭', item.address), field('register', '말투', item.register, true),
+            field('note', '특징', item.note), field('condition', '상황 조건', item.condition),
+            field('examples', '확인 예문', item.examples)
+          ];
+        case 'relationships':
+          return [
+            person('from', '인물', item.fromId), person('to', '대상', item.toId),
+            field('current', '현재 관계', item.current), field('trajectory', '전환', item.trajectory),
+            field('unresolved', '미해결', item.unresolved), field('visibility', '공개 범위', item.visibility)
+          ];
+        case 'facts': {
+          const occurrences = new Map();
+          const secrets = item.concealments.map(row => {
+            const number = (occurrences.get(row.holderId) || 0) + 1;
+            occurrences.set(row.holderId, number);
+            return {
+              key: `${row.holderId}:${number}`,
+              fields: [person('holder', '숨기는 인물', row.holderId), {
+                key: 'targets', label: '숨기는 대상', type: 'chips',
+                rows: row.targetIds.map(id => ({ key: id, value: actorName(room, id) }))
+              }, field('content', '내용', row.content)]
+            };
+          });
+          return [field('title', '제목', item.title), field('truth', '객관 사실', item.truth), {
+            key: 'knowledge', label: '인물별 인지', type: 'chips',
+            rows: item.knowledge.map(row => ({ key: row.actorId, label: actorName(room, row.actorId), value: row.status }))
+          }, { key: 'secrets', label: '숨기는 정보', type: 'secrets', rows: secrets }];
         }
-        for (const [key, entry] of Object.entries(object)) {
-          if (['actorId', 'holderId', 'speakerId', 'targetId', 'fromId', 'toId'].includes(key)) {
-            object[key] = actorName(room, entry);
-          } else if (key === 'targetIds') {
-            object[key] = entry.map(id => actorName(room, id));
-          } else if (key === 'id') {
-            delete object[key];
-          } else {
-            walk(entry);
-          }
+        default:
+          throw new SimpleRPError('지원하지 않는 변경사항 영역입니다.');
+      }
+    }
+    diffRows(before, after) {
+      const oldRows = new Map(before.map(row => [row.key, row]));
+      const newRows = new Map(after.map(row => [row.key, row]));
+      const oldOrder = new Map([...oldRows.keys()].filter(key => newRows.has(key)).map((key, index) => [key, index]));
+      const newOrder = new Map([...newRows.keys()].filter(key => oldRows.has(key)).map((key, index) => [key, index]));
+      return [...new Set([...newRows.keys(), ...oldRows.keys()])].map(key => [
+        oldRows.get(key), newRows.get(key),
+        oldOrder.has(key) && newOrder.has(key) && oldOrder.get(key) !== newOrder.get(key)
+      ]);
+    }
+    async renderDiffFields(before, after, highlight, isActive) {
+      const valueMarkup = async (oldValue = '', newValue = '', atomic = false) => {
+        if (!highlight) {
+          return html(newValue || oldValue);
+        }
+        if (atomic && oldValue !== newValue) {
+          return `${oldValue ? `<del>${html(oldValue)}</del>` : ''}${newValue ? `<ins>${html(newValue)}</ins>` : ''}`;
+        }
+        const parts = await diffWords(oldValue, newValue, isActive);
+        return parts.map(part => part.type === 'equal' ? html(part.text)
+          : `<${part.type === 'delete' ? 'del' : 'ins'}>${html(part.text)}</${part.type === 'delete' ? 'del' : 'ins'}>`).join('');
+      };
+      const blocks = [];
+      const fields = [];
+      const flushFields = () => {
+        if (fields.length) {
+          blocks.push(`<dl class="simplerp-record-fields">${fields.join('')}</dl>`);
+          fields.length = 0;
         }
       };
-      walk(output);
-      return output;
+      for (const [oldField, newField] of this.diffRows(before, after)) {
+        if (!isActive()) {
+          return '';
+        }
+        const field = newField || oldField;
+        let content;
+        let orderChanged = false;
+        if (field.type === 'chips') {
+          const chips = [];
+          for (const [oldRow, newRow, moved] of this.diffRows(oldField?.rows || [], newField?.rows || [])) {
+            orderChanged ||= moved;
+            const row = newRow || oldRow;
+            const label = row.label ? `${await valueMarkup(oldRow?.label, newRow?.label)} · ` : '';
+            chips.push(`<span class="simplerp-knowledge-chip"${field.key === 'knowledge' ? ` data-status="${html(row.value)}"` : ''}>${label}${await valueMarkup(oldRow?.value, newRow?.value, true)}</span>`);
+          }
+          content = `<div class="${field.key === 'knowledge' ? 'simplerp-knowledge-chips' : 'simplerp-target-chips'}">${chips.join('')}</div>`;
+          if (!chips.length) {
+            continue;
+          }
+        } else if (field.type === 'secrets') {
+          const secrets = [];
+          for (const [oldRow, newRow, moved] of this.diffRows(oldField?.rows || [], newField?.rows || [])) {
+            orderChanged ||= moved;
+            secrets.push(`<div class="simplerp-secret">${await this.renderDiffFields(oldRow?.fields || [], newRow?.fields || [], highlight, isActive)}</div>`);
+          }
+          content = secrets.join('');
+          if (!secrets.length) {
+            continue;
+          }
+        } else {
+          if (!oldField?.value && !newField?.value || ['title', 'name'].includes(field.key) && (!highlight || oldField?.value === newField?.value)) {
+            continue;
+          }
+          content = await valueMarkup(oldField?.value, newField?.value, field.atomic);
+        }
+        if (field.type) {
+          flushFields();
+          blocks.push(`<div class="simplerp-list-title">${html(field.label)}${highlight && orderChanged ? '<small>순서 변경</small>' : ''}</div>${content}`);
+        } else {
+          fields.push(`<dt>${html(field.label)}</dt><dd class="simplerp-diff-text">${content}</dd>`);
+        }
+      }
+      flushFields();
+      return blocks.join('');
     }
     async openSettings() {
       const controller = this.controller;
