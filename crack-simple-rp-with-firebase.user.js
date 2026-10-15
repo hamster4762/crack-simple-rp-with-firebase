@@ -2681,6 +2681,76 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       return null;
     }
   }
+  // 최근 10턴만 문맥으로 사용한다. 이미 받은 여유분은 최대 22메시지 안에서만
+  // 남겨 삭제 시 보충에 사용한다. 여유분 확보용 요청·DB 저장은 하지 않는다.
+  class RecentMessageCache {
+    constructor() {
+      this.clear();
+    }
+    clear() {
+      this.rows = [];
+      this.nextCursor = '';
+      this.hasOlder = true;
+      this.loaded = false;
+    }
+    messages() {
+      return completedHistory([...this.rows].reverse()).turns.slice(-10)
+        .flatMap(turn => turn.messages).reverse();
+    }
+    needsOlder() {
+      const count = completedHistory([...this.rows].reverse()).turns.length;
+      // 경계의 AI 앞에 USER가 있을 수도 있으므로 열 번째 턴도 온전히 확보한다.
+      return this.hasOlder && (count < 10 || count === 10 && this.rows.at(-1)?.role === 'assistant');
+    }
+    compact() {
+      this.rows = this.rows.filter(message => message.adopted && message.complete &&
+        (message.role === 'user' || message.role === 'assistant' && message.text.trim()));
+      if (this.rows.length > 22) {
+        this.rows.length = 22;
+        // 커서와 캐시 사이의 경계를 버렸으므로 그 커서를 이어 쓰지 않는다.
+        this.nextCursor = null;
+        this.hasOlder = true;
+      }
+    }
+    appendOlder(page) {
+      const ids = new Set(this.rows.map(message => message.id));
+      this.rows.push(...page.messages.filter(message => !ids.has(message.id)));
+      this.nextCursor = page.nextCursor;
+      this.hasOlder = Boolean(page.nextCursor);
+      this.loaded = true;
+      this.compact();
+    }
+    mergeNewest(page) {
+      const ids = new Set(this.rows.map(message => message.id));
+      const anchor = page.messages.findLastIndex(message => ids.has(message.id));
+      if (anchor < 0 && (this.rows.length || page.nextCursor)) {
+        return false;
+      }
+      const boundary = anchor < 0 ? -1 : this.rows.findIndex(message => message.id === page.messages[anchor].id);
+      const incomingIds = new Set(page.messages.map(message => message.id));
+      const older = this.rows.slice(boundary + 1).filter(message => !incomingIds.has(message.id));
+      this.rows = [...page.messages, ...older];
+      if (!older.length) {
+        this.nextCursor = page.nextCursor;
+        this.hasOlder = Boolean(page.nextCursor);
+      }
+      this.loaded = true;
+      this.compact();
+      return true;
+    }
+    update(messageId, message) {
+      const index = this.rows.findIndex(row => row.id === messageId);
+      if (index < 0) {
+        return;
+      }
+      if (message) {
+        this.rows[index] = message;
+      } else {
+        this.rows.splice(index, 1);
+      }
+      this.compact();
+    }
+  }
   class CrackAdapter {
     constructor() {
       this.onChange = () => {};
@@ -2727,26 +2797,36 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       }
       return parsed;
     }
+    async readRecentPage(identity, limit = 20, cursor = '') {
+      const url = `https://crack-api.wrtn.ai/crack-gen/v3/chats/${encodeURIComponent(identity.chatId)}/messages?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+      const payload = await this.request('GET', url);
+      const data = payload?.data || payload;
+      if (!Array.isArray(data?.messages)) {
+        throw new SimpleRPError('최근 메시지 배열을 확인하지 못했습니다.');
+      }
+      const nextCursor = data.nextCursor == null ? '' : String(data.nextCursor);
+      if (data.hasNext === true && !nextCursor) {
+        throw new SimpleRPError('남은 최근 메시지의 cursor가 없습니다.');
+      }
+      const messages = data.messages.map(normalizeMessage);
+      if (new Set(messages.map(message => message.id)).size !== messages.length) {
+        throw new SimpleRPError('최근 메시지 ID가 중복됩니다.');
+      }
+      return { messages, nextCursor };
+    }
     async recent(identity, limit = 20) {
       const messages = [];
       const cursors = new Set();
       let cursor = '';
       while (true) {
-        const url = `https://crack-api.wrtn.ai/crack-gen/v3/chats/${encodeURIComponent(identity.chatId)}/messages?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
-        const payload = await this.request('GET', url);
-        const data = payload?.data || payload;
-        const rows = data?.messages;
-        if (!Array.isArray(rows)) {
-          throw new SimpleRPError('최근 메시지 배열을 확인하지 못했습니다.');
-        }
-        const page = rows.map(row => normalizeMessage(row));
-        messages.push(...page);
+        const page = await this.readRecentPage(identity, limit, cursor);
+        messages.push(...page.messages);
         if (new Set(messages.map(message => message.id)).size !== messages.length) {
           throw new SimpleRPError('최근 메시지 ID가 중복됩니다.');
         }
         // 보통 20개 = 완료 10턴이다. 미채택 리롤·시스템 메시지가 섞인 때만
         // 실제 제공된 cursor로 부족한 턴을 보충한다. 검색 범위 자체는 10턴이다.
-        const next = data.nextCursor == null ? '' : String(data.nextCursor);
+        const next = page.nextCursor;
         if (limit !== 20 || completedHistory([...messages].reverse()).turns.length >= 10 || !next) {
           break;
         }
@@ -2764,23 +2844,6 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         }
       }
       return messages;
-    }
-    async recentAfterCompletion(identity, cached) {
-      // 신규 USER/AI 두 메시지와 직전 USER/AI를 대조한다. 이벤트 원문만으로
-      // 채택 경로를 추측하지 않으며 누락·리롤·중간 편집이면 최근 범위를 재조회한다.
-      const regularPairs = cached.length >= 2 && cached.length <= 20 && cached.length % 2 === 0 &&
-        cached.every((message, index) => message.adopted && message.complete && message.role === (index % 2 ? 'user' : 'assistant'));
-      if (regularPairs) {
-        const tail = await this.recent(identity, 4);
-        const appended = tail.slice(0, 2);
-        const previous = tail.slice(2);
-        if (tail.length === 4 && appended[0].role === 'assistant' && appended[1].role === 'user' &&
-            appended.every(message => message.adopted && message.complete && !cached.some(old => old.id === message.id)) &&
-            equal(previous, cached.slice(0, 2))) {
-          return [...appended, ...cached].slice(0, 20);
-        }
-      }
-      return this.recent(identity);
     }
     async readHistory(identity, assertActive, onProgress, turnLimit = Infinity) {
       let cursor = '';
@@ -2847,9 +2910,20 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       }
       return String(data?.title || data?.name || document.title.replace(/\s*\|\s*크랙.*$/, '') || '채팅방');
     }
-    async readMessage(identity, messageId) {
+    async readMessage(identity, messageId, allowMissing = false) {
       const url = `https://crack-api.wrtn.ai/crack-gen/v3/chats/${encodeURIComponent(identity.chatId)}/messages/${encodeURIComponent(messageId)}`;
-      const payload = await this.request('GET', url);
+      let payload;
+      try {
+        payload = await this.request('GET', url);
+      } catch (error) {
+        if (allowMissing && [404, 410].includes(error.status)) {
+          return null;
+        }
+        throw error;
+      }
+      if (allowMissing && payload?.data === null) {
+        return null;
+      }
       const message = normalizeMessage(payload?.data || payload);
       if (message.id !== messageId) {
         throw new SimpleRPError('단건 메시지 ID가 다릅니다.');
@@ -2859,16 +2933,18 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
     async removeOwnBlockVerified(identity, messageId, assertActive, savedUpdatedAt) {
       return this.patchVerified(identity, messageId, null, null, assertActive, true, savedUpdatedAt);
     }
-    async patchVerified(identity, messageId, expected, next, assertActive, removeOnly = false, savedUpdatedAt = 0) {
+    async patchVerified(identity, messageId, expected, next, assertActive, removeOnly = false, savedUpdatedAt = 0, source = null) {
       assertActive();
       if (!removeOnly && this.generation?.chatId === identity.chatId) {
         throw new SimpleRPError('AI 생성 중에는 carrier를 수정할 수 없습니다.');
       }
-      // 서로 독립인 읽기만 병렬화한다. 쓰기와 PATCH 후 재조회는 순차 검증한다.
-      const [fresh, head] = await Promise.all([
-        this.readMessage(identity, messageId),
-        this.recent(identity)
-      ]);
+      // 같은 직렬 작업에서 방금 읽은 carrier는 재사용한다. 그 사이 변경 신호가
+      // 왔다면 해당 메시지와 문맥 변경분만 갱신한다. 제거에는 최근 목록이 필요 없다.
+      const unchanged = source?.isCurrent();
+      const head = removeOnly ? [] : source
+        ? unchanged ? source.head : await source.readHead()
+        : [];
+      const fresh = unchanged ? source.fresh : await this.readMessage(identity, messageId);
       assertActive();
       assertInjectionNotNewer([fresh, ...head], savedUpdatedAt);
       if (removeOnly) {
@@ -2966,7 +3042,10 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
           }
           this.onChange(chatId, 'completed');
         } else if (/(?:edit|delet|updat).*message|message.*(?:edit|delet|updat)/i.test(frame.event)) {
-          this.onChange(chatId);
+          const data = frame.payload?.data || frame.payload;
+          const messageId = String(data?.messageId || data?._id || data?.id || '');
+          const kind = /delet/i.test(frame.event) ? 'deleted' : 'edited';
+          this.onChange(chatId, kind, messageId);
         }
       });
       socket.addEventListener('close', () => {
@@ -3134,10 +3213,9 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       this.pendingOperation = Promise.resolve();
       this.operationCount = 0;
       this.recentTurns = [];
-      this.recentMessages = [];
+      this.messageCache = new RecentMessageCache();
+      this.messageChanges = new Map();
       this.messageChangeSequence = 0;
-      // 최근 메시지를 확인한 변경 번호. 이벤트 이후의 오래된 캐시와 빈 유효 캐시도 구별한다.
-      this.recentMessagesSequence = -1;
       this.turnCountCache = null;
       this.preview = null;
       this.requestCache = null;
@@ -3150,6 +3228,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       // 쓰기 출처 검증은 현재 URL/계정/epoch와 단건 메시지 ID로 수행한다.
       this.adapter.onChange = (chatId, kind, messageId) => {
         this.messageChangeSequence += 1;
+        this.markMessageChange(kind, messageId);
         if (this.turnCountCache) {
           const cachedTurns = this.turnCountCache.recent;
           // 최근 경계 밖 삭제·종류 불명 변경은 숫자를 추측하지 않는다.
@@ -3161,14 +3240,8 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         }
         const previewVisible = this.ui?.main.open && this.ui.currentTab === 'home' && this.showingCurrentRoom;
         if (!this.injection.intent && !this.injection.unknown && !this.injection.carrierId && !previewVisible) {
-          // OFF 상태로 편집/대화만 하는 동안 서버 문맥을 읽을 이유가 없다.
-          // 메뉴 진입·주입 시작에서 새로 읽으므로 오래된 캐시는 버린다.
-          this.recentMessages = [];
+          // 변경 ID만 남긴다. 다음 메뉴 진입/주입 시작에서 변경분을 반영한다.
           return;
-        }
-        if (kind !== 'completed') {
-          // 수정·삭제·연결 끊김은 단순 추가가 아니다. 캐시 병합 대신 경로를 재확인한다.
-          this.recentMessages = [];
         }
         this.scheduleRefresh();
       };
@@ -3199,6 +3272,89 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       this.pendingOperation = next;
       return next;
     }
+    // 변경 대기열은 캐시 안의 ID와 추가/범위 불명 신호만 보관한다.
+    // 캐시에 없는 편집 대상은 이전 리롤의 재채택일 수도 있어 범위를 재구성한다.
+    markMessageChange(kind, messageId = '') {
+      let key;
+      if (kind === 'edited' || kind === 'deleted') {
+        if (messageId && !this.messageCache.rows.some(message => message.id === messageId)) {
+          if (kind === 'edited') {
+            key = '*';
+          } else if (!this.messageCache.loaded || this.operationCount) {
+            // 조회 중 새 ID가 생겼다면 그 변경을 응답 도착 후에도 반영한다.
+            key = '+';
+          } else {
+            return;
+          }
+        } else {
+          key = messageId || '*';
+        }
+      } else {
+        key = kind === 'completed' || kind === 'changed' ? '+' : '*';
+      }
+      this.messageChanges.set(key, { kind, sequence: this.messageChangeSequence });
+    }
+    // 주입 쓰기와 같은 직렬 대기열에서 호출한다. 수신 중 새 이벤트는 다음
+    // 갱신까지 남겨 두고, 실패한 조회는 기존 유효 캐시를 손상시키지 않는다.
+    async readRecentContext(assertActive) {
+      assertActive();
+      const identity = this.identity;
+      const changes = new Map(this.messageChanges);
+      const cache = new RecentMessageCache();
+      Object.assign(cache, this.messageCache, { rows: [...this.messageCache.rows] });
+      const reset = async () => {
+        const page = await this.adapter.readRecentPage(identity);
+        assertActive();
+        cache.clear();
+        cache.appendOlder(page);
+      };
+      if (!cache.loaded || changes.has('*')) {
+        await reset();
+      } else {
+        for (const [messageId, change] of changes) {
+          if (messageId === '+') {
+            continue;
+          }
+          // 삭제 요청 실패도 있을 수 있으므로 단건 결과로 삭제 여부를 확인한다.
+          const message = await this.adapter.readMessage(identity, messageId, change.kind === 'deleted');
+          assertActive();
+          cache.update(messageId, message);
+          if (!message) {
+            this.knownCarrierIds.delete(messageId);
+          }
+        }
+        if (changes.has('+')) {
+          const page = await this.adapter.readRecentPage(identity, 4);
+          assertActive();
+          if (!cache.mergeNewest(page)) {
+            // 재접속/다량 추가로 공통 경계가 사라졌을 때만 최근 범위를 다시 구성한다.
+            await reset();
+          }
+        }
+      }
+      const cursors = new Set();
+      while (cache.needsOlder()) {
+        if (cache.nextCursor === null) {
+          await reset();
+          continue;
+        }
+        if (cursors.has(cache.nextCursor)) {
+          throw new SimpleRPError('최근 로그 cursor가 반복됩니다.');
+        }
+        cursors.add(cache.nextCursor);
+        const page = await this.adapter.readRecentPage(identity, 4, cache.nextCursor);
+        assertActive();
+        cache.appendOlder(page);
+      }
+      assertActive();
+      this.messageCache = cache;
+      for (const [key, change] of changes) {
+        if (this.messageChanges.get(key) === change) {
+          this.messageChanges.delete(key);
+        }
+      }
+      return cache.messages();
+    }
     async activateRoute() {
       const route = routeIdentity();
       if (!route) {
@@ -3219,7 +3375,8 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       this.currentRoomCache = null;
       this.preview = null;
       this.recentTurns = [];
-      this.recentMessages = [];
+      this.messageCache.clear();
+      this.messageChanges.clear();
       this.turnCountCache = null;
       this.messageChangeSequence += 1;
       this.requestCache = null;
@@ -3398,9 +3555,8 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       if (!this.identity || this.loadingCurrent || this.injection.blocked || this.injection.phase === 'ERROR' && !this.currentRoomCache) {
         return;
       }
-      // 메뉴 조회만 캐시를 재사용한다. 이벤트 갱신·생성/오류 재확인·전송 준비는 생략하지 않는다.
-      if (onlyIfNeeded && !recover && !this.adapter.generation && !this.injection.error &&
-          this.recentMessagesSequence === this.messageChangeSequence) {
+      // 유효한 문맥을 메뉴 조회만으로 다시 다운로드하지 않는다.
+      if (onlyIfNeeded && !recover && this.messageCache.loaded && !this.messageChanges.size) {
         return;
       }
       if (this.polling) {
@@ -3417,18 +3573,11 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       const sequence = this.messageChangeSequence;
       let headRead = false;
       try {
-        const generation = this.adapter.generation;
-        const appendOnly = !recover && generation?.chatId === identity.chatId &&
-          generation.kind === 'send' && generation.completionObserved;
-        const head = appendOnly
-          ? await this.adapter.recentAfterCompletion(identity, this.recentMessages)
-          : await this.adapter.recent(identity);
+        const head = await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
         this.assertFrame(epoch, identity);
         if (this.currentRoomCache) {
           assertInjectionNotNewer(head, this.currentRoomCache.meta.updatedAt);
         }
-        this.recentMessages = sequence === this.messageChangeSequence ? head : [];
-        this.recentMessagesSequence = sequence;
         if (sequence === this.messageChangeSequence) {
           this.updateTurnCount(head);
         }
@@ -3460,7 +3609,13 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             // 단발 재확인. 스트리밍 동안 일정 간격으로 서버를 읽는 폴링은 하지 않는다.
             generation.verificationScheduled = true;
             clearTimeout(this.refreshTimer);
-            this.refreshTimer = setTimeout(() => this.scheduleRefresh(), 1500);
+            this.refreshTimer = setTimeout(() => {
+              if (this.adapter.generation !== generation) {
+                return;
+              }
+              this.markMessageChange('completed');
+              this.scheduleRefresh();
+            }, 1500);
           }
         }
         const own = head.filter(message => stripOwnBlock(message.text).found);
@@ -3480,20 +3635,24 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
           this.injection.carrierId = own[0].id;
         }
         const stable = selectCarrier(head);
-        const needsReconcile = this.injection.intent && !this.adapter.generation && (recover || changed || this.injection.phase === 'PENDING');
+        const needsReconcile = this.injection.intent && !this.adapter.generation &&
+          (recover || changed || Boolean(this.injection.error));
+        if (!needsReconcile && this.injection.intent && !this.adapter.generation && !this.injection.error) {
+          this.injection.phase = 'ON';
+        }
         // 갱신 작업이 직접 계산할 후보는 미리 중복 계산하지 않는다. 저장 시에는
         // preview를 비우므로, 로그가 그대로여도 새 저장본으로 후보를 계산한다.
         if (stable && this.currentRoomCache && !this.adapter.generation && !needsReconcile && (changed || recover || !this.preview)) {
           this.preview = selectInjection(this.currentRoomCache, this.recentTurns, '', stripOwnBlock(stable.text).text);
         }
         if (needsReconcile) {
-          await this.reconcile('observed', '', { head, epoch, sequence });
+          await this.reconcile('observed');
         }
         if (!this.injection.error && this.ui?.persistentError === previousIssue) {
           this.ui.persistentError = '';
           this.ui.renderHeader();
         }
-        if (!needsReconcile && (changed || recover)) {
+        if (!needsReconcile) {
           this.paint();
         }
       } catch (error) {
@@ -3538,9 +3697,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       this.injection.intent = true;
       await this.reconcile('start');
     }
-    async reconcile(reason, pendingUser = '', observed = null) {
-      // 다른 쓰기 뒤에 대기해야 한다면 사전에 읽은 목록을 재사용하지 않는다.
-      const reusableObserved = this.operationCount === 0 ? observed : null;
+    async reconcile(reason, pendingUser = '') {
       return this.queueOperation(async () => {
         if (!this.injection.intent || !this.currentRoomCache) {
           return;
@@ -3568,11 +3725,10 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             // 저장은 끝났지만 생성 중인 carrier를 수정하지 않는다. 완료 감지 후 재시도.
             return;
           }
-          // 동일 갱신에서 방금 확인한 목록만 재사용한다. 대기열 중 새 이벤트나
-          // 방 전환이 있었다면 다시 읽고, PATCH 직전/직후 서버 검증은 별도 유지한다.
+          // 최근 목록은 이벤트가 알려 준 변경분만 갱신한다. carrier의 실제 원문은
+          // 별도 단건 GET으로 확인하며, 그 결과를 같은 작업의 PATCH에도 사용한다.
           const headSequence = this.messageChangeSequence;
-          const head = reusableObserved?.epoch === epoch && reusableObserved.sequence === headSequence
-            ? reusableObserved.head : await this.adapter.recent(identity);
+          const head = await this.readRecentContext(assertActive);
           assertActive();
           assertInjectionNotNewer(head, saved.meta.updatedAt);
           const carrier = selectCarrier(head);
@@ -3582,6 +3738,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
           const fresh = await this.adapter.readMessage(identity, carrier.id);
           assertActive();
           assertInjectionNotNewer([fresh], saved.meta.updatedAt);
+          head[head.findIndex(message => message.id === carrier.id)] = fresh;
           const stripped = stripOwnBlock(fresh.text);
           const turns = completedHistory([...head].reverse()).turns;
           const selection = selectInjection(saved, turns, pendingUser, stripped.text);
@@ -3607,7 +3764,11 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             // 쓰지 않은 동일 원문을 다시 조회하지 않는다.
             raw = fresh.text;
           } else {
-            raw = await this.adapter.patchVerified(identity, carrier.id, fresh.text, selection.raw, assertActive, false, saved.meta.updatedAt);
+            raw = await this.adapter.patchVerified(identity, carrier.id, fresh.text, selection.raw, assertActive, false, saved.meta.updatedAt, {
+              fresh, head,
+              isCurrent: () => headSequence === this.messageChangeSequence && !this.messageChanges.size,
+              readHead: () => this.readRecentContext(assertActive)
+            });
           }
           // 새 carrier 먼저 검증, 이전 자신의 블록 정리. 타 확프 블록은 보존.
           const confirmedTexts = new Map([[carrier.id, raw]]);
@@ -3632,15 +3793,23 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             throw new SimpleRPError('서버 실제 raw가 주입 상한을 초과해 해제했습니다.');
           }
           assertActive();
-          this.recentMessages = headSequence === this.messageChangeSequence ? head.map(message => ({
+          for (const [messageId, text] of confirmedTexts) {
+            const message = this.messageCache.rows.find(row => row.id === messageId);
+            if (message) {
+              this.messageCache.update(messageId, { ...message, text });
+            }
+          }
+          const confirmedHead = head.map(message => ({
             ...message,
             text: confirmedTexts.get(message.id) ?? message.text
-          })) : [];
-          this.recentMessagesSequence = headSequence;
+          }));
+          // 자체 PATCH를 다음 대화 변경으로 오인하지 않도록 확인된 원문을 함께 반영한다.
+          // 도중 새 이벤트를 반영한 캐시까지 처리한 척하지 않고 이번 선택의 기준만 기록한다.
+          this.lastHead = JSON.stringify(confirmedHead.map(message => [message.id, message.text, message.complete, message.role, message.adopted]));
           if (headSequence === this.messageChangeSequence) {
             this.updateTurnCount(head);
           }
-          this.recentTurns = turns;
+          this.recentTurns = completedHistory([...confirmedHead].reverse()).turns;
           this.preview = selection;
           this.injection = {
             phase: 'ON',
@@ -3654,7 +3823,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
           // 이번에 읽은 문맥에 서버가 확인한 수정 원문까지 반영한 목록만 반환한다.
           // 도중에 변경 신호가 있었으면 전송 준비에서 새로 조회한다.
           return headSequence === this.messageChangeSequence
-            ? { head: this.recentMessages, sequence: headSequence } : null;
+            ? { head: confirmedHead, sequence: headSequence } : null;
         } catch (error) {
           if (epoch === this.routeEpoch && !this.blockNewerInjection(error)) {
             this.injection.phase = 'OFF';
@@ -3672,7 +3841,11 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       assertInjectionNotNewer(head, savedUpdatedAt);
       const ids = new Set([...this.knownCarrierIds, ...head.filter(message => stripOwnBlock(message.text).found).map(message => message.id)]);
       for (const id of ids) {
-        await this.adapter.removeOwnBlockVerified(identity, id, assertActive, savedUpdatedAt);
+        const text = await this.adapter.removeOwnBlockVerified(identity, id, assertActive, savedUpdatedAt);
+        const message = this.messageCache.rows.find(row => row.id === id);
+        if (message) {
+          this.messageCache.update(id, { ...message, text });
+        }
       }
     }
     async stopInjection(removeUnownedBlock = false) {
@@ -3700,8 +3873,8 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             error: ''
           };
           this.knownCarrierIds.clear();
-          // 해제로 서버 원문이 바뀌었으므로 이전 주입이 담긴 문맥 캐시는 재사용하지 않는다.
-          this.recentMessagesSequence = -1;
+          this.recentTurns = completedHistory([...this.messageCache.messages()].reverse()).turns;
+          this.preview = null;
         } catch (error) {
           if (epoch === this.routeEpoch && !this.blockNewerInjection(error)) {
             this.injection.phase = 'OFF';
@@ -3725,6 +3898,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       if (this.adapter.generation) {
         // 완료 이벤트를 놓쳤다면 사용자 전송 시 최신 상태를 다시 확인한다.
         // 서버 확인 전 전송하거나 완료되지 않은 생성을 완료로 추측하지 않는다.
+        this.markMessageChange('completed');
         await this.refreshCurrent(false);
         this.assertFrame(epoch, identity);
       }
@@ -3737,22 +3911,19 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
       let reconciled = null;
       if (this.injection.intent) {
         let pending = text;
-        let observed = null;
         if (frame.event === 'reroll') {
-          const sequence = this.messageChangeSequence;
-          const head = await this.adapter.recent(identity);
+          const head = await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
           this.assertFrame(epoch, identity);
           pending = head.find(message => message.role === 'user')?.text || '';
-          observed = { head, epoch, sequence };
         }
-        reconciled = await this.reconcile('before-send', pending, observed);
+        reconciled = await this.reconcile('before-send', pending);
         this.assertFrame(epoch, identity);
         if (this.injection.phase !== 'ON') {
           throw new SimpleRPError('주입 확인 전에는 전송하지 않습니다.');
         }
       }
       const head = reconciled?.sequence === this.messageChangeSequence
-        ? reconciled.head : await this.adapter.recent(identity, 8);
+        ? reconciled.head : await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
       this.assertFrame(epoch, identity);
       return {
         frontier: head.find(message => message.role === 'assistant')?.id || '',
@@ -7364,13 +7535,6 @@ button[aria-pressed=true], .simplerp-active {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         void checkRoute();
-        controller.recentMessages = [];
-        controller.messageChangeSequence += 1;
-        const previewVisible = ui.main.open && ui.currentTab === 'home' && controller.showingCurrentRoom;
-        if (controller.identity && !routeCheckBusy &&
-            (controller.injection.intent || controller.injection.unknown || controller.injection.carrierId || previewVisible)) {
-          controller.scheduleRefresh();
-        }
       }
     });
     window.addEventListener('popstate', () => void checkRoute());
