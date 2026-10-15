@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      1.0.0.2
+// @version      1.0.1.0
 // @description  수동 기억 구축·검토·저장과 RP 연속성 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
