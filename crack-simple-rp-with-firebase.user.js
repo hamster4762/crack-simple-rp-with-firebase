@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      1.0.1.0
+// @version      1.0.1.1
 // @description  수동 기억 구축·검토·저장과 RP 연속성 주입 (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -2925,7 +2925,12 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         }
         throw error;
       }
-      const parsed = response.text ? JSON.parse(response.text) : null;
+      let parsed;
+      try {
+        parsed = response.text ? JSON.parse(response.text) : null;
+      } catch {
+        throw new SimpleRPError('Crack 서버 응답 형식을 읽을 수 없습니다.', { code: 'RESPONSE' });
+      }
       if (parsed?.result && String(parsed.result).toUpperCase() !== 'SUCCESS') {
         throw new SimpleRPError('Crack이 요청 성공을 확인하지 않았습니다.');
       }
@@ -3124,7 +3129,14 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         if (checked.text !== expected) {
           throw new SimpleRPError('PATCH 후 원문이 예상과 다릅니다. 추가 쓰기를 중단했습니다. 서버 내용을 확인하세요.');
         }
-        if (writeError && ![404, 405].includes(writeError.status)) {
+        // 다음 서버 시도는 위 단건 조회로 미반영을 확인한 뒤에만 허용한다.
+        // 서버 장애·통신/응답 손상은 넘기되 인증·권한·요청 제한은 우회하지 않는다.
+        const canTryNext = writeError && (
+          [404, 405].includes(writeError.status) ||
+          writeError.status >= 500 && writeError.status < 600 ||
+          ['NETWORK', 'RESPONSE'].includes(writeError.code)
+        );
+        if (writeError && !canTryNext) {
           throw writeError;
         }
       }
@@ -3782,10 +3794,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         if (needsReconcile) {
           await this.reconcile('observed');
         }
-        if (!this.injection.error && this.ui?.persistentError === previousIssue) {
-          this.ui.persistentError = '';
-          this.ui.renderHeader();
-        }
+        this.clearResolvedInjectionError(previousIssue);
         if (!needsReconcile) {
           this.paint();
         }
@@ -3803,6 +3812,12 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
           this.refreshAgain = false;
           this.scheduleRefresh();
         }
+      }
+    }
+    clearResolvedInjectionError(previousIssue) {
+      if (previousIssue && !this.injection.error && this.ui?.persistentError === previousIssue) {
+        this.ui.persistentError = '';
+        this.ui.renderHeader();
       }
     }
     // 이 실행에서만 중지한다. 서버 주입본이나 DB를 수정하지 않는다.
@@ -3839,6 +3854,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         this.repository.assertWritable?.();
         const epoch = this.routeEpoch;
         const identity = clone(this.identity);
+        const previousIssue = this.injection.error;
         // 저장 캐시는 편집하지 않고 저장/방 전환 시 객체째 교체한다. 읽기 전용
         // 참조를 고정하고 동일 객체인지 검증하여 매 턴 전체 기억 복제를 피한다.
         const saved = this.currentRoomCache;
@@ -3953,6 +3969,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             carrierId: carrier.id,
             error: ''
           };
+          this.clearResolvedInjectionError(previousIssue);
           this.paint();
           // 이번에 읽은 문맥에 서버가 확인한 수정 원문까지 반영한 목록만 반환한다.
           // 도중에 변경 신호가 있었으면 전송 준비에서 새로 조회한다.
@@ -3989,8 +4006,11 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
         }
         const epoch = this.routeEpoch;
         const identity = clone(this.identity);
+        const previousIssue = this.injection.error;
         const assertActive = () => this.assertFrame(epoch, identity);
         const savedUpdatedAt = this.currentRoomCache?.meta.updatedAt ?? (removeUnownedBlock ? null : 0);
+        // 해제 요청 후에는 실패해도 백그라운드 갱신이 다시 주입하지 않는다.
+        this.injection.intent = false;
         this.injection.phase = 'PENDING';
         this.paint();
         try {
@@ -4007,8 +4027,14 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
             error: ''
           };
           this.knownCarrierIds.clear();
-          this.recentTurns = completedHistory([...this.messageCache.messages()].reverse()).turns;
-          this.preview = null;
+          const recent = this.messageCache.messages();
+          this.recentTurns = completedHistory([...recent].reverse()).turns;
+          const carrier = selectCarrier(recent);
+          // 해제로 갱신한 캐시에서 후보를 복구한다. 추가 서버 조회는 하지 않는다.
+          this.preview = carrier && this.currentRoomCache
+            ? selectInjection(this.currentRoomCache, this.recentTurns, '', stripOwnBlock(carrier.text).text)
+            : null;
+          this.clearResolvedInjectionError(previousIssue);
         } catch (error) {
           if (epoch === this.routeEpoch && !this.blockNewerInjection(error)) {
             this.injection.phase = 'OFF';
