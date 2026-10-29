@@ -225,12 +225,6 @@
   function storageDataError(repository, cause, location, storedVersion) {
     return cause instanceof StorageDataError ? cause : new StorageDataError(repository, cause, location, storedVersion);
   }
-  class MigrationRequiredError extends StorageDataError {
-    constructor(repository, version) {
-      super(repository, new SimpleRPError('전체 자료를 새 데이터구조로 변환해야 합니다. 변환 전 백업을 권장합니다.'), 'schemaVersion', version);
-      this.migrationRequired = true;
-    }
-  }
   function storageVersionLabel(value) {
     if (value === undefined || value === null) {
       return '미기록 / 확인 불가';
@@ -927,7 +921,7 @@
   }
   function stripOwnBlock(raw) {
     let found = false;
-    const text = String(raw).replace(/\r?\n?<!-- simplerp-memory v=1(?: saved=\d+)?\r?\n[\s\S]*?-->/g, () => {
+    const text = String(raw).replace(/\r?\n?<!-- simplerp-memory v=\d+(?: saved=\d+)?\r?\n[\s\S]*?-->/g, () => {
       found = true;
       return '';
     });
@@ -943,7 +937,7 @@
       return;
     }
     for (const message of messages) {
-      for (const header of String(message.text).matchAll(/<!-- simplerp-memory v=1 saved=(\d+)\r?\n/g)) {
+      for (const header of String(message.text).matchAll(/<!-- simplerp-memory v=\d+ saved=(\d+)\r?\n/g)) {
         if (Number(header[1]) > savedUpdatedAt) {
           throw new SimpleRPError('다른 기기에서 더 최신 저장본을 주입했습니다. 이 기기의 주입을 중단했습니다. 새로고침하여 최신 저장본을 불러오세요.', { code: 'NEWER_INJECTION' });
         }
@@ -1230,7 +1224,7 @@ A → B 관계는 A가 B를 향한 의미·태도이며 B의 감정/인지를 �
       return base;
     }
     const body = safeComment(formatInjection(room, selected));
-    return `${base}\n<!-- simplerp-memory v=1 saved=${room.meta.updatedAt}\n${body}\n-->`;
+    return `${base}\n<!-- simplerp-memory v=${SCHEMA_VERSION} saved=${room.meta.updatedAt}\n${body}\n-->`;
   }
   function selectInjection(room, turns, pendingUser, carrierBase) {
     const context = makeContext(turns, pendingUser);
@@ -1869,14 +1863,31 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         throw new SimpleRPError('로컬 초기화 중에는 저장할 수 없습니다.');
       }
     }
-    open() {
+    open(allowMigration = true) {
       if (this.resetting) {
         return Promise.reject(new SimpleRPError('로컬 초기화 완료 전에는 데이터를 불러올 수 없습니다.'));
       }
       if (this.databasePromise) {
         return this.databasePromise;
       }
-      this.databasePromise = new Promise((resolve, reject) => {
+      this.databasePromise = (async () => {
+        let database = await this.openCurrentDatabase();
+        if (!database) {
+          if (!allowMigration) {
+            throw new SimpleRPError('저장소 선택 후 자동으로 전환합니다.', { code: 'MIGRATION_PENDING' });
+          }
+          await this.migrate();
+          database = await this.openCurrentDatabase();
+        }
+        return database;
+      })().catch(error => {
+        this.databasePromise = null;
+        throw error;
+      });
+      return this.databasePromise;
+    }
+    openCurrentDatabase() {
+      return new Promise((resolve, reject) => {
         const request = indexedDB.open(DATABASE_NAME, SCHEMA_VERSION);
         let migrationRequired = false;
         request.onupgradeneeded = event => {
@@ -1905,7 +1916,6 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           };
           if (!database.objectStoreNames.contains('meta')) {
             database.close();
-            this.databasePromise = null;
             reject(storageDataError(this, new SimpleRPError('구조 버전 저장소가 없습니다.'), 'IndexedDB.meta', undefined));
             return;
           }
@@ -1914,7 +1924,6 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           transaction.oncomplete = () => {
             if (version.result !== SCHEMA_VERSION) {
               database.close();
-              this.databasePromise = null;
               reject(storageDataError(this, new SimpleRPError('저장된 데이터구조 버전이 다릅니다.'), 'meta.schemaVersion', version.result));
             } else {
               resolve(database);
@@ -1923,19 +1932,21 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           transaction.onabort = () => reject(new SimpleRPError('로컬 버전을 확인하지 못했습니다.'));
         };
         request.onerror = async () => {
-          this.databasePromise = null;
+          if (migrationRequired) {
+            resolve(null);
+            return;
+          }
           let storedVersion;
           if (request.error?.name === 'VersionError') {
             const recovery = await this.readRecoveryVersion().catch(() => ({}));
             storedVersion = recovery.schemaVersion ?? recovery.databaseVersion;
           }
-          reject(migrationRequired ? new MigrationRequiredError(this, 1) : request.error?.name === 'VersionError'
+          reject(request.error?.name === 'VersionError'
             ? storageDataError(this, request.error, 'IndexedDB.databaseVersion', storedVersion)
             : new SimpleRPError('로컬 저장소를 열지 못했습니다. 브라우저 저장 권한/용량을 확인하세요.'));
         };
-        request.onblocked = () => reject(new SimpleRPError('다른 탭이 로컬 저장소 갱신을 막고 있습니다. 다른 Crack 탭을 닫고 다시 시도하세요.'));
+        request.onblocked = () => this.onNotice?.(new SimpleRPError('저장소 전환 대기 중입니다. 다른 Crack 탭을 닫으면 계속합니다.'));
       });
-      return this.databasePromise;
     }
     async readRecord(storeName, key) {
       const database = await this.open();
@@ -1995,7 +2006,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       });
     }
     async snapshot(validate = true) {
-      const database = await this.open();
+      const database = await this.open(validate);
       if (!['rooms', 'settings', 'meta'].every(name => database.objectStoreNames.contains(name))) {
         throw storageDataError(this, new SimpleRPError('필수 저장소가 없습니다.'), 'IndexedDB.objectStores', undefined);
       }
@@ -2050,13 +2061,10 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       }).finally(() => database.close());
       const converted = await transformStoredSnapshot(before.snapshot, 'local');
       this.database?.close();
-      this.databasePromise = null;
       await new Promise((resolve, reject) => {
         const request = indexedDB.open(DATABASE_NAME, SCHEMA_VERSION);
         let failure;
-        let upgraded = false;
         request.onupgradeneeded = () => {
-          upgraded = true;
           const transaction = request.transaction;
           const metadata = transaction.objectStore('meta');
           const stamp = metadata.get('updatedAt');
@@ -2077,11 +2085,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         };
         request.onsuccess = () => {
           request.result.close();
-          if (!upgraded) {
-            reject(new SimpleRPError('다른 탭에서 이미 변환했습니다. 새로고침하세요.'));
-          } else {
-            resolve();
-          }
+          resolve();
         };
         request.onerror = () => reject(failure || new SimpleRPError('로컬 변환을 적용하지 못했습니다. 원본은 유지됩니다.'));
         request.onblocked = () => this.onNotice?.(new SimpleRPError('변환 대기 중입니다. 다른 Crack 탭을 닫으면 계속합니다.'));
@@ -2566,7 +2570,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
     get root() {
       return `simpleRP/v${SCHEMA_VERSION}`;
     }
-    async ensureReady() {
+    async ensureReady(allowMigration = true) {
       if (this.versionError) {
         throw this.versionError;
       }
@@ -2577,7 +2581,11 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
             return;
           }
           if (Number.isInteger(version) && version > 0 && version < SCHEMA_VERSION) {
-            throw new MigrationRequiredError(this, version);
+            if (!allowMigration) {
+              throw new SimpleRPError('저장소 선택 후 자동으로 전환합니다.', { code: 'MIGRATION_PENDING' });
+            }
+            await this.migrate();
+            return;
           }
           if (version === null) {
             const before = await this.request('GET', 'simpleRP');
@@ -2606,6 +2614,9 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         throw this.versionError;
       }
       const before = await this.request('GET', 'simpleRP');
+      if (before.data?.schemaVersion === SCHEMA_VERSION) {
+        return;
+      }
       if (before.data?.schemaVersion !== 1) {
         throw new SimpleRPError('저장소 버전이 변경됐습니다. 새로고침하여 확인하세요.');
       }
@@ -2619,7 +2630,6 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         }
         throw error;
       }
-      this.readyPromise = null;
       this.etags.clear();
       this.conflicts.clear();
     }
@@ -2708,7 +2718,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       return Object.entries(data || {}).map(([roomKey, meta]) => ({ roomKey, ...meta }));
     }
     async snapshot(validate = true) {
-      await this.ensureReady();
+      await this.ensureReady(validate);
       const result = await this.request('GET', this.root);
       if (!result.etag) {
         throw new SimpleRPError('Firebase ETag를 받지 못했습니다. 조건부 저장을 생략하지 않습니다.');
@@ -3048,7 +3058,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       const config = settings.firebaseConfig;
       const response = await privilegedHttp({
         method: 'POST', service: 'Firebase AI Logic', signal, timeout: 180000,
-        url: `https://firebasevertexai.googleapis.com/v1beta/projects/${encodeURIComponent(config.projectId)}/models/${encodeURIComponent(model.id)}:generateContent`,
+        url: `https://firebasevertexai.googleapis.com/v1beta/projects/${encodeURIComponent(config.projectId)}/locations/global/publishers/google/models/${encodeURIComponent(model.id)}:generateContent`,
         headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': config.apiKey, 'X-Firebase-AppCheck': token },
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text }] }],
@@ -4977,6 +4987,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
     "clock": "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 6v6l4 2\"/>",
     "key": "<circle cx=\"8\" cy=\"8\" r=\"5\"/><path d=\"m12 12 9 9m-3-3 3-3m-6 0 3-3\"/>",
     "diff": "<path d=\"M8 3v18m-4-4 4 4 4-4M16 21V3m-4 4 4-4 4 4\"/>",
+    "undo": "<path d=\"M3 10a9 9 0 1 1 2.7 8M3 4v6h6\"/>",
     "help": "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M9 8a3 3 0 0 1 6 1c0 2-3 2-3 4m0 3h.01\"/>",
     "flame": "<path d=\"M12 2c1 5 6 6 6 11a6 6 0 0 1-12 0c0-3 2-5 3-7 0 3 1 4 2 4 2-2 2-5 1-8Z\"/><path d=\"M12 12c-2 2-3 3-3 5a3 3 0 0 0 6 0c0-2-2-3-3-5Z\"/>"
   };
@@ -5500,15 +5511,17 @@ button[aria-pressed=true], .simplerp-active {
 .simplerp-help-section dl {
     margin: 0;
     display: grid;
-    grid-template-columns: 58px minmax(0, 1fr);
+    grid-template-columns: max-content minmax(0, 1fr);
     gap: 4px 8px;
 }
 .simplerp-help-section dt {
     color: #cbd5e7;
+    white-space: nowrap;
 }
 .simplerp-help-section dd {
     margin: 0;
     color: #b0bdd2;
+    overflow-wrap: anywhere;
 }
 .simplerp-conflict-warning {
     color: #ffacba;
@@ -6140,9 +6153,14 @@ button[aria-pressed=true], .simplerp-active {
                 .simplerp-build-heading small { margin-left:auto; font-size:10px; }
                 .simplerp-auto-row { display:flex; align-items:flex-start; gap:8px; padding:0 0 5px; border-bottom:1px solid var(--simplerp-line); margin-bottom:5px; }
                 .simplerp-auto-model { flex:1; min-width:0; }
-                .simplerp-auto-model strong { display:block; line-height:30px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:12px; font-weight:500; }
-                .simplerp-auto-model small { display:block; height:18px; line-height:18px; font-size:10px; color:var(--simplerp-muted); }
-                .simplerp-auto-actions { display:flex; align-items:center; height:30px; gap:4px; flex-shrink:0; }
+                .simplerp-auto-name { display:flex; align-items:center; gap:6px; height:32px; }
+                .simplerp-auto-name > .simplerp-icon { width:20px; height:20px; flex-shrink:0; }
+                .simplerp-auto-name strong { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:14px; font-weight:600; }
+                .simplerp-auto-model small { display:block; height:18px; line-height:18px; padding-left:26px; font-size:10px; color:var(--simplerp-muted); }
+                .simplerp-auto-actions { display:flex; align-items:center; height:32px; gap:4px; flex-shrink:0; }
+                .simplerp-settings-controls { display:flex; align-items:center; justify-content:flex-end; gap:6px; margin-left:auto; }
+                .simplerp-settings-controls input { width:64px; min-width:0; text-align:right; }
+                .simplerp-settings-controls small { color:var(--simplerp-muted); }
                 .simplerp-auto-actions .simplerp-icon-btn { border:0; background:transparent; }
                 .simplerp-manual-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:0 6px; }
                 .simplerp-manual-grid button { min-width:0; height:36px; font-size:12px; white-space:nowrap; }
@@ -6522,7 +6540,7 @@ button[aria-pressed=true], .simplerp-active {
       const controller = this.controller;
       const auto = controller.auto;
       if (auto.job) {
-        return { text: ({ loading: '로그 읽는 중', building: 'AI 구축 중', compressing: 'AI 압축 중', saving: '저장 중' })[auto.job.phase], badge: '◆', state: 'working' };
+        return { text: ({ loading: '로그 읽는 중', building: 'AI 구축 중', compressing: 'AI 압축 중', saving: '저장 중' })[auto.job.phase], badge: '', state: 'working' };
       }
       if (auto.warning) {
         return { text: '구축 실패 · 이력 확인', badge: '!', state: 'error' };
@@ -6559,7 +6577,9 @@ button[aria-pressed=true], .simplerp-active {
       const busy = Boolean(controller.auto.job);
       return `<div class="simplerp-build-panel">
         <div class="simplerp-build-heading">자동구축 ${iconButton('help', '자동구축 도움말', 'help', 'data-help="auto-build"')}</div>
-        <div class="simplerp-auto-row"><div class="simplerp-auto-model"><strong>◆ ${html(model?.name || 'API 설정 필요')}</strong><small>${html(status.text)}</small></div>
+        <div class="simplerp-auto-row"><div class="simplerp-auto-model">
+          <div class="simplerp-auto-name" ${controller.api.settings ? 'style="color:#b5a0df"' : ''}>${icon(controller.api.settings ? 'flame' : 'key')}<strong>${html(model?.name || 'API 설정 필요')}</strong></div>
+          <small>${html(status.text)}</small></div>
           <div class="simplerp-auto-actions">${iconButton('auto-history', '자동구축 이력', 'clock')}${iconButton('auto-run', busy ? '자동구축 중지' : '자동구축 바로실행', busy ? 'stop' : 'play', !controller.api.settings && !busy ? 'disabled' : '')}${switchButton('auto-enabled', '이 방 자동구축', controller.auto.enabled, controller.api.settings || busy ? '' : 'disabled')}</div>
         </div>
         <div class="simplerp-build-heading">수동구축 ${iconButton('help', '수동구축 도움말', 'help', 'data-help="manual-build"')}<small>마지막 구축 ${controller.draft.lastBuild.lastTurn}턴</small></div>
@@ -6697,6 +6717,7 @@ button[aria-pressed=true], .simplerp-active {
           .auto-badge[data-state=working] { background:#594376; border-color:#9d82c0; }
           .auto-badge[data-state=waiting] { background:#315365; border-color:#729bae; }
           .auto-badge[data-state=error] { background:#783e49; border-color:#da8b98; }
+          .auto-badge svg { width:12px; height:12px; }
           @keyframes simplerp-wait { to { transform:rotate(360deg); } }
           </style>
           <button type="button" aria-label="SimpleRP · 주입 확인 중"><span class="spin"></span></button>`;
@@ -6719,9 +6740,11 @@ button[aria-pressed=true], .simplerp-active {
       button.setAttribute('aria-label', `SimpleRP · ${label}${this.controller.auto.enabled ? ` · ${status.text}` : ''}`);
       const badge = this.controller.auto.enabled || this.controller.auto.job || this.controller.auto.warning;
       const badgeText = /^\d+$/.test(status.badge) && Number(status.badge) > 99 ? '99+' : status.badge;
-      const markup = `${phase === 'ERROR' ? '!' : phase === 'PENDING' ? '<span class="spin"></span>' : phase === 'WAITING' ? '대기' : phase}${badge ? `<span class="auto-badge" data-state="${status.state}" title="${html(status.text)}">${html(badgeText)}</span>` : ''}`;
-      if (button.innerHTML !== markup) {
+      const badgeContent = status.state === 'working' ? icon('flame') : html(badgeText);
+      const markup = `${phase === 'ERROR' ? '!' : phase === 'PENDING' ? '<span class="spin"></span>' : phase === 'WAITING' ? '대기' : phase}${badge ? `<span class="auto-badge" data-state="${status.state}" title="${html(status.text)}">${badgeContent}</span>` : ''}`;
+      if (this.launcherMarkup !== markup) {
         button.innerHTML = markup;
+        this.launcherMarkup = markup;
       }
     }
     async action(action, button) {
@@ -6742,24 +6765,6 @@ button[aria-pressed=true], .simplerp-active {
           return controller.setAutoEnabled(!controller.auto.enabled);
         case 'auto-run':
           return controller.auto.job ? this.stopAutoBuild() : this.openAutoRun();
-        case 'storage-migrate': {
-          const repository = this.storageIssue?.repository;
-          if (!repository || this.storageRecoveryBusy || (await this.confirm('데이터 v2로 전환', '다른 기기에서 실행 중인 v1을 닫고 원본 백업을 먼저 저장하세요.\n모든 방과 설정을 v2로 변환하고 이전 저장 경로를 제거합니다. 이 작업은 되돌릴 수 없습니다.')) !== 'apply') {
-            return;
-          }
-          this.storageRecoveryBusy = true;
-          this.render();
-          try {
-            await repository.migrate();
-            this.storageIssue = null;
-            this.persistentError = '';
-            await controller.activateRoute();
-          } finally {
-            this.storageRecoveryBusy = false;
-            this.render();
-          }
-          return;
-        }
         case 'error-details':
           return this.openErrorDetails(button);
         case 'storage-backup':
@@ -7268,7 +7273,7 @@ button[aria-pressed=true], .simplerp-active {
         firebaseConfig: {}, debugToken: ''
       });
       let context;
-      context = this.modal('자동구축 API 설정', `<label class="simplerp-field"><span>제공업체</span><select aria-label="제공업체"><option>Firebase AI Logic</option></select></label>
+      context = this.modal('자동구축 API 설정', `<label class="simplerp-field"><span>제공업체</span><select aria-label="제공업체"><option>Firebase AI Logic (Vertex AI)</option></select></label>
         <div data-model-controls>${this.modelControls(settings)}</div>
         <div class="simplerp-toolbar"><strong>Firebase AI Logic</strong><button type="button" data-ai-guide>연동 가이드</button></div>
         <label class="simplerp-field"><span>Firebase config</span><textarea rows="5" data-ai-config spellcheck="false"></textarea></label>
@@ -7302,15 +7307,23 @@ button[aria-pressed=true], .simplerp-active {
     }
     openAIGuide() {
       const context = this.modal('Firebase AI Logic 연동 가이드', `<div class="simplerp-connection-guide">
-        <details open><summary>1. AI용 프로젝트와 웹 앱</summary><ol><li><a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer">Firebase 콘솔</a>에서 개인 프로젝트를 만들고 웹 앱(&lt;/&gt;)을 등록하세요. DB용 프로젝트와 달라도 됩니다.</li><li>프로젝트 설정 → 일반 → 웹 앱의 Config를 복사해 API 설정의 Firebase config에 붙여 넣으세요.</li></ol></details>
-        <details><summary>2. Firebase AI Logic 사용 설정</summary><ol><li>콘솔의 Firebase AI Logic → 시작하기에서 <b>Gemini Developer API</b>를 선택하고 안내에 따라 API를 사용 설정하세요.</li><li>이 확프에는 Google AI Studio 키가 아닌 <b>Firebase 웹 앱 config의 apiKey</b>를 입력합니다.</li><li>프로젝트의 모델 이용 가능 여부와 할당량을 확인하세요. 유료 요금제를 사용하면 AI 요청에 요금이 발생할 수 있습니다.</li></ol></details>
-        <details><summary>3. App Check 디버그 토큰</summary><ol><li>콘솔 → App Check에서 위 웹 앱을 등록하세요. 앱 메뉴의 <b>디버그 토큰 관리</b>를 여세요.</li><li>토큰을 직접 지정해야 하는 경우 <b>토큰 만들기</b>로 생성한 값을 콘솔의 허용 목록에 등록하세요.</li><li>등록한 동일 토큰을 API 설정의 App Check 디버그 토큰에 붙여 넣고 저장하세요.</li><li>토큰은 프로젝트 이용 권한이므로 공유하지 마세요. 노출되면 콘솔에서 삭제하고 새 토큰으로 교체하세요.</li></ol><button type="button" data-create-debug>토큰 만들기 · 복사</button><small data-debug-created></small></details>
-        <details><summary>4. 모델·추론 선택</summary><ol><li>모델을 선택하고 해당 모델의 추론 수준을 지정하세요.</li><li>채팅방의 자동구축을 켜고 주입을 시작하세요. 즉시 요청하려면 바로실행을 사용하세요.</li></ol><a href="https://firebase.google.com/docs/ai-logic/app-check" target="_blank" rel="noopener noreferrer">Firebase 공식 App Check 안내</a></details>
+        <details open><summary>1. 프로젝트·웹 앱 등록</summary><ol>
+          <li><a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer">Firebase 콘솔</a>에서 사용할 프로젝트를 엽니다.</li>
+          <li>프로젝트 설정 → 일반 → 내 앱에서 웹 앱(&lt;/&gt;)을 등록합니다.</li>
+          <li>웹 앱의 Config를 복사해 API 설정의 Firebase config에 붙여 넣습니다.</li>
+        </ol></details>
+        <details><summary>2. AI Logic 사용 설정</summary><ol>
+          <li>AI 서비스 → AI Logic → 시작하기를 누릅니다.</li>
+          <li>API 제공업체에서 <b>Agent Platform Gemini API(Vertex AI)</b>를 선택하고 사용 설정을 완료합니다.</li>
+          <li>프로젝트의 결제(Blaze) 설정과 사용할 모델의 할당량을 확인합니다.</li>
+        </ol></details>
+        <details><summary>3. App Check 디버그 토큰</summary><ol>
+          <li>보안 → App Check → 앱에서 등록한 웹 앱을 찾습니다.</li>
+          <li>앱 오른쪽 ⋮ → 디버그 토큰 관리를 엽니다.</li>
+          <li>콘솔에서 새 디버그 토큰을 만들고 복사합니다.</li>
+          <li>API 설정의 App Check 디버그 토큰에 붙여 넣고 저장합니다.</li>
+        </ol></details>
       </div>`, [['닫기', () => this.closeModal(context)]]);
-      context.body.querySelector('[data-create-debug]').addEventListener('click', () => this.run(async () => {
-        await copyFullText(crypto.randomUUID());
-        context.body.querySelector('[data-debug-created]').textContent = ' 복사됨 · 콘솔과 API 설정에 같은 값을 붙여 넣으세요.';
-      }));
     }
     async stopAutoBuild() {
       const controller = this.controller;
@@ -7396,7 +7409,7 @@ button[aria-pressed=true], .simplerp-active {
         const pages = Math.max(1, Math.ceil(list.length / 8));
         page = Math.min(page, pages - 1);
         context.body.innerHTML = `<div class="simplerp-history-bar"><div class="simplerp-history-tabs" role="tablist">${[['current', '현재방'], ['all', '전체방']].map(([key, label]) => `<button type="button" role="tab" data-history-scope="${key}" aria-selected="${scope === key}" aria-pressed="${scope === key}">${label}</button>`).join('')}</div><span class="simplerp-history-retention">이력은 이 기기에만 저장됩니다.<br>최대 보관: 방별 5건 / 전체 50건</span><button type="button" data-history-clear ${list.length ? '' : 'disabled'}>일괄삭제</button></div>
-          <div class="simplerp-list">${list.slice(page * 8, page * 8 + 8).map(row => `<div class="simplerp-history-row" data-failed="${['failed', 'cancelled'].includes(row.outcome)}"><span>◆</span><div><strong>${html(AI_MODELS.find(item => item.id === row.model)?.name || row.model)} · ${html(REASONING_LABELS[row.reasoning] || '')} · ${GUIDE_LABELS[row.mode]}</strong><small>${scope === 'all' ? `${html(row.roomName)} · ` : ''}${new Date(row.createdAt).toLocaleString('ko-KR')}${row.outcome === 'failed' ? ' · 실패' : row.outcome === 'cancelled' ? ' · 중지' : row.outcome === 'compressed' ? ' · 압축으로 계속' : ''}</small></div>${row.error ? `<button type="button" class="simplerp-icon-btn simplerp-alert" data-history-error="${row.id}" aria-label="실패 내용">!</button>` : ''}<button type="button" class="simplerp-icon-btn" data-history-download="${row.id}" aria-label="응답 다운로드">${icon('download')}</button><button type="button" class="simplerp-icon-btn" data-history-diff="${row.id}" aria-label="적용 전후 비교">${icon('diff')}</button><button type="button" class="simplerp-icon-btn" data-history-delete="${row.id}" aria-label="이력 삭제">${icon('trash')}</button></div>`).join('') || '<p class="simplerp-empty">이력 없음</p>'}</div>
+          <div class="simplerp-list">${list.slice(page * 8, page * 8 + 8).map(row => `<div class="simplerp-history-row" data-failed="${['failed', 'cancelled'].includes(row.outcome)}"><span>${icon('flame')}</span><div><strong>${html(AI_MODELS.find(item => item.id === row.model)?.name || row.model)} · ${html(REASONING_LABELS[row.reasoning] || '')} · ${GUIDE_LABELS[row.mode]}</strong><small>${scope === 'all' ? `${html(row.roomName)} · ` : ''}${new Date(row.createdAt).toLocaleString('ko-KR')}${row.outcome === 'failed' ? ' · 실패' : row.outcome === 'cancelled' ? ' · 중지' : row.outcome === 'compressed' ? ' · 압축으로 계속' : ''}</small></div>${row.error ? `<button type="button" class="simplerp-icon-btn simplerp-alert" data-history-error="${row.id}" aria-label="실패 내용">!</button>` : ''}<button type="button" class="simplerp-icon-btn" data-history-download="${row.id}" aria-label="응답 다운로드">${icon('download')}</button><button type="button" class="simplerp-icon-btn" data-history-diff="${row.id}" aria-label="적용 전후 비교">${icon('diff')}</button><button type="button" class="simplerp-icon-btn" data-history-delete="${row.id}" aria-label="이력 삭제">${icon('trash')}</button></div>`).join('') || '<p class="simplerp-empty">이력 없음</p>'}</div>
           <div class="simplerp-history-page"><button type="button" data-page="-1" ${page ? '' : 'disabled'}>이전</button><small>${page + 1} / ${pages}</small><button type="button" data-page="1" ${page + 1 < pages ? '' : 'disabled'}>다음</button></div>`;
       };
       context.body.addEventListener('click', event => this.run(async () => {
@@ -7980,16 +7993,17 @@ button[aria-pressed=true], .simplerp-active {
           </section>
           <section class="simplerp-settings-section">
             <div class="simplerp-settings-heading"><h3>자동구축</h3></div>
-            <div class="simplerp-toolbar"><label class="simplerp-field"><span>구축 주기 (턴)</span><input type="number" min="1" step="1" data-auto-period value="${settings.autoBuildPeriod}"></label><button type="button" class="simplerp-icon-btn" data-reset-period aria-label="구축 주기 기본값">↶</button></div>
+            <div class="simplerp-guide-row"><strong>구축주기</strong>
+              <div class="simplerp-settings-controls"><input type="number" min="1" step="1" data-auto-period value="${settings.autoBuildPeriod}" aria-label="구축주기"><small>턴</small><button type="button" class="simplerp-icon-btn" data-reset-period aria-label="구축주기 기본값">${icon('undo')}</button></div>
+            </div>
           </section>
           <section class="simplerp-settings-section">
             <div class="simplerp-settings-heading">
               <h3>백업</h3>
               <small>데이터구조 v${SCHEMA_VERSION}</small>
             </div>
-            <div class="simplerp-toolbar">
-              <button type="button" class="simplerp-btn" data-backup>전체 백업</button>
-              <button type="button" class="simplerp-btn" data-restore>전체 복원</button>
+            <div class="simplerp-guide-row"><strong>전체데이터</strong>
+              <div class="simplerp-settings-controls"><button type="button" class="simplerp-btn" data-backup>백업</button><button type="button" class="simplerp-btn" data-restore>복원</button></div>
             </div>
           </section>`;
         context.body.querySelectorAll('[data-guide-mode]').forEach(button => button.addEventListener('click', () => {
@@ -8488,7 +8502,11 @@ button[aria-pressed=true], .simplerp-active {
         [local, remote] = await Promise.all([
           controller.localRepository.snapshot(false), remoteRepository.snapshot(false)
         ]);
-      } catch {
+      } catch (error) {
+        if (error.code === 'MIGRATION_PENDING') {
+          commitConnection();
+          return true;
+        }
         return useSelectedStorageOnly();
       }
       assertSource();
@@ -8541,27 +8559,25 @@ button[aria-pressed=true], .simplerp-active {
     // ── 도움말: 사용자 선택에 필요한 기준만 섹션별로 제공한다. ──
     storageErrorView(issue, recovery = false) {
       const newer = issue.storedVersion > SCHEMA_VERSION;
-      const migrate = issue.migrationRequired;
       const diagnostic = [
         `저장 위치: ${issue.location}`,
         `실패 항목: ${issue.path}`,
         issue.line ? `JSON ${issue.line}행` : '',
         issue.detail, issue.context
       ].filter(Boolean).join('\n');
-      return `<p>${migrate ? '기존 자료를 새 데이터구조로 전환해야 합니다.' : newer ? '더 최신 구조의 데이터입니다. SimpleRP를 업데이트한 뒤 새로고침하세요.' : '저장된 데이터에 오류가 있어 읽어올 수 없습니다.'}</p>
+      return `<p>${newer ? '더 최신 구조의 데이터입니다. SimpleRP를 업데이트한 뒤 새로고침하세요.' : '저장된 데이터에 오류가 있어 읽어올 수 없습니다.'}</p>
         <dl class="simplerp-error-versions">
           <dt>저장소</dt><dd>${issue.repository.backend === 'firebase' ? 'Firebase' : '로컬'}</dd>
           <dt>저장된 데이터 버전</dt><dd data-stored-version>${html(storageVersionLabel(issue.storedVersion))}</dd>
-          <dt>확프 데이터 버전</dt><dd>${SCHEMA_VERSION}</dd>
+          <dt>지원 데이터 버전</dt><dd>${SCHEMA_VERSION}</dd>
         </dl>
         <pre class="simplerp-error-diagnostic" data-storage-diagnostic>${html(diagnostic)}</pre>
         ${newer ? '<a href="https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js" target="_blank" rel="noopener noreferrer">SimpleRP 업데이트</a>' : ''}
-        ${recovery ? `<p>${migrate ? '원본 백업 후 데이터 전환을 실행하세요. 다른 기기의 v1은 먼저 종료해야 합니다.' : newer ? '이 버전에서는 복원·초기화할 수 없습니다.' : '초기화가 필요할 수 있습니다. 먼저 원본 백업을 저장하세요.'}</p>
+        ${recovery ? `<p>${newer ? '이 버전에서는 복원·초기화할 수 없습니다.' : '초기화가 필요할 수 있습니다. 먼저 원본 백업을 저장하세요.'}</p>
         <p>원본 백업은 오류가 있는 데이터를 그대로 보관하는 파일입니다. 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.</p>
         <div class="simplerp-actions">
           ${textButton('storage-backup', '원본 백업', '', this.storageRecoveryBusy ? 'disabled' : '')}
-          ${migrate ? textButton('storage-migrate', 'v2로 전환', '', this.storageRecoveryBusy ? 'disabled' : '') : ''}
-          ${!newer && !migrate ? `<button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>` : ''}
+          ${!newer ? `<button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>` : ''}
         </div>` : ''}`;
     }
     async openErrorDetails(anchor) {
@@ -8692,16 +8708,16 @@ button[aria-pressed=true], .simplerp-active {
     help(kind, anchor) {
       const sections = {
         'auto-build': [
-          ['동작', [['실행 조건', 'API 설정·이 방 자동구축·주입 사용 켜짐'], ['대상 로그', '예약 턴까지 반영, 가장 최신 턴 제외'], ['구축 방식', '기억이 없으면 전체구축, 이후 이어서구축'], ['완료', '검사 후 자동저장·주입 갱신']]],
-          ['추가 압축', [['조건', '선별한 주입 예정량이 40,000자 초과'], ['횟수·요금', '최대 1회 추가 요청, 별도 비용 가능'], ['실패', '기존 저장본·주입 유지, 이력 확인']]],
-          ['이 기기 설정', [['기기 전용', 'API 설정과 방별 자동 토글은 이 기기에만 저장']]],
-          ['편집·중지', [['편집', '요청 중 현재방 편집 제한, 중지 후 가능'], ['AI 요청 중', '중지 시 응답 미적용·미저장'], ['저장 중', '전송된 저장은 중지 불가'], ['요금', '중지해도 전송된 AI 요청은 과금 가능']]],
-          ['다중 접속', [['중복 요청', '같은 방을 여러 기기·탭에서 자동구축하면 중복 요금 가능']]]
+          ['동작', [['조건', 'API 설정·이 방 자동구축·주입 사용 켜짐'], ['로그', '예약 턴까지 반영, 가장 최신 턴 제외'], ['방식', '기억이 없으면 전체구축, 이후 이어서구축'], ['완료', '검사 후 자동저장·주입 갱신']]],
+          ['추가압축', [['조건', '선별한 주입 예정량이 40,000자 초과'], ['횟수·요금', '최대 1회 추가 요청, 별도 비용 가능'], ['실패', '기존 저장본·주입 유지, 이력 확인']]],
+          ['설정', [['저장위치', 'API 설정과 방별 자동 토글은 이 기기에만 저장']]],
+          ['편집·중지', [['편집', '요청 중 현재방 편집 제한, 중지 후 가능'], ['AI요청중', '중지 시 응답 미적용·미저장'], ['저장중', '전송된 저장은 중지 불가'], ['요금', '중지해도 전송된 AI 요청은 과금 가능']]],
+          ['다중접속', [['중복요청', '같은 방 여러 기기·탭에서 자동구축하면 중복 요금 가능']]]
         ],
         'manual-build': [
-          ['기능', [['전체구축', '전체 로그로 기억 구성'], ['이어서구축', '기존 기억에 선택한 최신 로그 반영'], ['압축', '중복 통합·표현 정리'], ['JSON 가져오기', '검사·변경사항 확인 후 수정본에 적용']]],
-          ['압축 주의사항', [['내용 보존', '내용 소실·의미 변경 가능'], ['적용 전', '변경사항 확인 필요']]],
-          ['사용 순서', [['1', '지침·로그 받기'], ['2', '외부 AI에 요청하여 JSON 받기'], ['3', 'JSON 가져오기·검토·적용 후 저장']]]
+          ['기능', [['전체구축', '전체 로그로 기억 구성'], ['이어서구축', '기존 기억에 선택한 최신 로그 반영'], ['압축', '중복 통합·표현 정리'], ['JSON가져오기', '검사·변경사항 확인 후 적용']]],
+          ['압축시주의', [['내용보존', '내용 소실·의미 변경 가능'], ['적용전', '변경사항 확인 필요']]],
+          ['사용순서', [['1', '지침·로그 받기'], ['2', '외부 AI에 요청하여 JSON 받기'], ['3', 'JSON 가져오기·검토·적용 후 저장']]]
         ],
         dates: [
           ['자동주입', [['최근', '최신 날짜의 로그를 주입에 포함'], ['관련', '문맥과 관련된 로그를 주입에 포함']]],
@@ -8777,14 +8793,14 @@ button[aria-pressed=true], .simplerp-active {
     if (!root?.isConnected) {
       return;
     }
-    const starts = renderedMemoryNodes(root).filter(node => node.nodeValue.includes('simplerp-memory v=1'));
+    const starts = renderedMemoryNodes(root).filter(node => node.nodeValue.includes('simplerp-memory v='));
     for (const start of starts) {
       let container = start.parentElement;
       let removed = false;
       for (let depth = 0; container && container !== document.body && depth < 14; depth += 1, container = container.parentElement) {
         const nodes = renderedMemoryNodes(container);
         const joined = nodes.map(node => node.nodeValue).join('');
-        const block = /(?:\\)?(?:<!--|&lt;!--)\s*simplerp-memory v=1[\s\S]*?(?:-->|--&gt;)/.exec(joined);
+        const block = /(?:\\)?(?:<!--|&lt;!--)\s*simplerp-memory v=\d+[\s\S]*?(?:-->|--&gt;)/.exec(joined);
         if (!block) {
           continue;
         }
@@ -8815,7 +8831,7 @@ button[aria-pressed=true], .simplerp-active {
         if (![Node.TEXT_NODE, Node.ELEMENT_NODE].includes(root.nodeType)) {
           continue;
         }
-        if (root.nodeType === Node.TEXT_NODE && !root.nodeValue.includes('simplerp-memory v=1')) {
+        if (root.nodeType === Node.TEXT_NODE && !root.nodeValue.includes('simplerp-memory v=')) {
           continue;
         }
         hideRenderedMemory(root);
