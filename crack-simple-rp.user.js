@@ -7321,11 +7321,12 @@ button[aria-pressed=true], .simplerp-active {
       });
       let context;
       const readSettings = async () => {
+        const config = context.body.querySelector('[data-ai-config]').value.trim();
         const token = context.body.querySelector('[data-ai-token]').value.trim();
-        if (!token) {
+        if (!config || !token) {
           return null;
         }
-        const source = context.body.querySelector('[data-ai-config]').value.trim().replace(/^(?:const|let|var)\s+firebaseConfig\s*=\s*/, '').replace(/;\s*$/, '').replace(/(^|[{,]\s*)([a-zA-Z][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
+        const source = config.replace(/^(?:const|let|var)\s+firebaseConfig\s*=\s*/, '').replace(/;\s*$/, '').replace(/(^|[{,]\s*)([a-zA-Z][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
         const input = await JsonWork.run('parse', source);
         const validator = new SchemaValidator();
         const firebaseConfig = {};
@@ -7375,7 +7376,7 @@ button[aria-pressed=true], .simplerp-active {
         try {
           const next = await readSettings();
           if (!next) {
-            throw new SimpleRPError('App Check 디버그 토큰을 입력하세요.');
+            throw new SimpleRPError('Firebase config와 App Check 디버그 토큰을 입력하세요.');
           }
           await new FirebaseAIClient(next).generate('연결 확인입니다. {"ok":true}만 JSON으로 응답하세요.', next, testAbort.signal, { testConnection: true });
           status.textContent = '연결 성공';
