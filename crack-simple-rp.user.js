@@ -7358,7 +7358,16 @@ button[aria-pressed=true], .simplerp-active {
       // 연결 테스트는 입력 중인 설정으로만 실행하며 저장된 API 설정을 변경하지 않는다.
       const testAbort = new AbortController();
       context.cleanups.push(() => testAbort.abort());
+      let testError = '';
+      const testErrorButton = document.createElement('button');
+      testErrorButton.type = 'button';
+      testErrorButton.className = 'simplerp-icon-btn simplerp-alert';
+      testErrorButton.setAttribute('aria-label', '연결 테스트 오류 상세');
+      testErrorButton.textContent = '!';
+      testErrorButton.addEventListener('click', () => this.run(() => this.openErrorDetails(testErrorButton, testError)));
       context.body.querySelector('[data-ai-test]').addEventListener('click', () => this.run(async () => {
+        testErrorButton.remove();
+        testError = '';
         const controls = [...context.body.querySelectorAll('input, textarea, select, button')];
         const status = context.body.querySelector('[data-ai-test-status]');
         controls.forEach(control => { control.disabled = true; });
@@ -7373,6 +7382,8 @@ button[aria-pressed=true], .simplerp-active {
         } catch (error) {
           if (!testAbort.signal.aborted) {
             status.textContent = '연결 실패';
+            testError = errorMessage(error);
+            status.before(testErrorButton);
             throw error;
           }
         } finally {
@@ -8674,17 +8685,17 @@ button[aria-pressed=true], .simplerp-active {
           ${!newer ? `<button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>` : ''}
         </div>` : ''}`;
     }
-    async openErrorDetails(anchor) {
+    async openErrorDetails(anchor, message) {
       this.helpPopover?.remove();
       const popover = document.createElement('div');
       popover.className = 'simplerp-help-popover';
       popover.setAttribute('popover', 'auto');
-      const issue = this.storageIssue;
+      const issue = message === undefined ? this.storageIssue : null;
       if (issue) {
         popover.innerHTML = this.storageErrorView(issue);
       } else {
-        const message = this.controller.injection.error || this.persistentError || this.controller.auto.warning || '';
-        const [summary, ...details] = normalizeText(message).split('\n');
+        const content = message ?? (this.controller.injection.error || this.persistentError || this.controller.auto.warning || '');
+        const [summary, ...details] = normalizeText(content).split('\n');
         popover.innerHTML = `<p class="simplerp-error-summary">${html(summary)}</p>${details.length ? `<section class="simplerp-server-detail"><h4>상세 내용</h4><pre>${html(details.join('\n'))}</pre></section>` : ''}`;
       }
       // 모달 내부에 두어 팝업 본문도 클릭·스크롤 가능한 영역에 포함한다.
