@@ -2368,7 +2368,16 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
                 ? '요청이 너무 많습니다. 잠시 후 다시 시도하세요.'
                 : response.status >= 500 ? '서버 오류입니다. 잠시 후 다시 시도하세요.'
                   : '인증과 접근 권한을 확인하세요.';
-              finish(reject, new SimpleRPError(`${service} 요청 실패 (${response.status}). ${guidance}`, {
+              let serverMessage = '';
+              try {
+                const error = JSON.parse(response.responseText).error;
+                serverMessage = typeof error === 'string' ? error : [error?.status, error?.message,
+                  ...(Array.isArray(error?.details) ? error.details.map(detail => detail.reason || detail.description || detail.message) : [])
+                ].filter(Boolean).join('\n');
+              } catch {
+                // JSON 오류 응답이 없을 때만 HTTP 상태별 안내를 사용한다.
+              }
+              finish(reject, new SimpleRPError(`${service} 요청 실패 (${response.status}).\n${serverMessage || guidance}`, {
                 code: 'HTTP',
                 status: response.status,
                 retryAfterMs: Number.isFinite(retryAfterMs) ? Math.max(1000, retryAfterMs) : 30000
@@ -2912,11 +2921,12 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
 
   // ── 기기 전용 자동구축 자료: Firebase DB·DB 인증과 공유하지 않는다. ──
   const AI_MODELS = [
+    { id: 'gemini-4-argon', name: 'Gemini 4 Argon', levels: ['low', 'medium', 'high'], default: 'medium', maxOutputTokens: 32768 },
     { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', levels: ['low', 'medium', 'high'], default: 'medium' },
     { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', levels: ['low', 'medium', 'high'], default: 'medium' },
-    { id: 'gemini-4-argon', name: 'Gemini 4 Argon', levels: ['low', 'medium', 'high'], default: 'medium', maxOutputTokens: 32768 },
-    { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (미리보기)', levels: ['low', 'medium', 'high'], default: 'high' }
+    { id: 'gemini-3.1-pro-preview', name: 'gemini-3.1-pro-preview', levels: ['low', 'medium', 'high'], default: 'high' }
   ];
+  const DEFAULT_AI_MODEL = AI_MODELS.find(model => model.id === 'gemini-3.8-flash');
   const REASONING_LABELS = { minimal: '최소', low: '낮음', medium: '보통', high: '높음' };
   const GUIDE_LABELS = { full: '전체구축', continue: '이어서구축', compress: '압축' };
   class AutoBuildStore {
@@ -3002,8 +3012,8 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
     }
   }
   class FirebaseAIClient {
-    constructor() {
-      this.settings = GM_getValue(API_SETTINGS_KEY, null);
+    constructor(settings = GM_getValue(API_SETTINGS_KEY, null)) {
+      this.settings = settings;
       this.token = null;
       this.pendingToken = null;
     }
@@ -3046,7 +3056,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       }
       return this.pendingToken.promise;
     }
-    async generate(text, settings, signal) {
+    async generate(text, settings, signal, { testConnection = false } = {}) {
       const model = AI_MODELS.find(item => item.id === settings?.model);
       if (!model || !model.levels.includes(settings.reasoning)) {
         throw new SimpleRPError('API 설정에서 모델과 추론을 선택하세요.');
@@ -3057,16 +3067,23 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       }
       const config = settings.firebaseConfig;
       const response = await privilegedHttp({
-        method: 'POST', service: 'Firebase AI Logic', signal, timeout: 180000,
+        method: 'POST', service: 'Firebase AI Logic', signal, timeout: testConnection ? 30000 : 180000,
         url: `https://firebasevertexai.googleapis.com/v1beta/projects/${encodeURIComponent(config.projectId)}/locations/global/publishers/google/models/${encodeURIComponent(model.id)}:generateContent`,
         headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': config.apiKey, 'X-Firebase-AppCheck': token },
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text }] }],
-          generationConfig: { responseMimeType: 'application/json', maxOutputTokens: model.maxOutputTokens ?? 65536, thinkingConfig: { thinkingLevel: settings.reasoning.toUpperCase() } }
+          generationConfig: {
+            responseMimeType: 'application/json',
+            maxOutputTokens: testConnection ? 256 : (model.maxOutputTokens ?? 65536),
+            thinkingConfig: { thinkingLevel: settings.reasoning.toUpperCase() }
+          }
         })
       });
       const envelope = JSON.parse(response.text);
       const candidate = envelope.candidates?.[0];
+      if (testConnection && candidate?.finishReason === 'MAX_TOKENS') {
+        return '';
+      }
       if (candidate?.finishReason && candidate.finishReason !== 'STOP') {
         throw new SimpleRPError(`AI 응답을 적용하지 않았습니다 (${candidate.finishReason}). 모델 한도·응답 차단 여부를 확인하세요.`);
       }
@@ -6552,10 +6569,10 @@ button[aria-pressed=true], .simplerp-active {
         return { text: '자동구축 꺼짐', badge: '', state: 'idle' };
       }
       if (!controller.injection.intent) {
-        return { text: '주입 중에만 동작', badge: 'Ⅱ', state: 'paused' };
+        return { text: '주입 중에만 동작', badge: '-', state: 'paused' };
       }
       if (controller.currentDraftDirty) {
-        return { text: '수정본 저장 후 재개', badge: 'Ⅱ', state: 'paused' };
+        return { text: '수정본 저장 후 재개', badge: '-', state: 'paused' };
       }
       if (!controller.turnCountCache && auto.initialized) {
         return { text: '턴수 확인 필요 · 바로실행', badge: '↻', state: 'paused' };
@@ -6733,15 +6750,15 @@ button[aria-pressed=true], .simplerp-active {
       if (!button) {
         return;
       }
-      const phase = this.controller.injection.phase === 'ERROR' ? 'ERROR' : this.controller.loadingCurrent ? 'PENDING' : this.controller.injection.phase;
+      const phase = this.controller.injection.phase === 'ERROR' ? 'ERROR' : this.controller.loadingCurrent ? 'PENDING' : this.controller.injection.phase === 'WAITING' ? 'ON' : this.controller.injection.phase;
       button.dataset.phase = phase;
       const status = this.autoStatus();
-      const label = phase === 'ERROR' ? '오류 · 메뉴에서 상세 확인' : phase === 'PENDING' ? '주입 확인 중' : phase === 'WAITING' ? '기억 생성 대기' : `주입 ${phase}`;
+      const label = phase === 'ERROR' ? '오류 · 메뉴에서 상세 확인' : phase === 'PENDING' ? '주입 확인 중' : `주입 ${phase}`;
       button.setAttribute('aria-label', `SimpleRP · ${label}${this.controller.auto.enabled ? ` · ${status.text}` : ''}`);
       const badge = this.controller.auto.enabled || this.controller.auto.job || this.controller.auto.warning;
       const badgeText = /^\d+$/.test(status.badge) && Number(status.badge) > 99 ? '99+' : status.badge;
       const badgeContent = status.state === 'working' ? icon('flame') : html(badgeText);
-      const markup = `${phase === 'ERROR' ? '!' : phase === 'PENDING' ? '<span class="spin"></span>' : phase === 'WAITING' ? '대기' : phase}${badge ? `<span class="auto-badge" data-state="${status.state}" title="${html(status.text)}">${badgeContent}</span>` : ''}`;
+      const markup = `${phase === 'ERROR' ? '!' : phase === 'PENDING' ? '<span class="spin"></span>' : phase}${badge ? `<span class="auto-badge" data-state="${status.state}" title="${html(status.text)}">${badgeContent}</span>` : ''}`;
       if (this.launcherMarkup !== markup) {
         button.innerHTML = markup;
         this.launcherMarkup = markup;
@@ -7229,7 +7246,7 @@ button[aria-pressed=true], .simplerp-active {
     }
     // ── 기기 전용 API 설정: DB 연결·로그인과 공유하지 않는다. ──
     modelControls(settings) {
-      const model = AI_MODELS.find(item => item.id === settings.model) || AI_MODELS[0];
+      const model = AI_MODELS.find(item => item.id === settings.model) || DEFAULT_AI_MODEL;
       return `<div class="simplerp-model-controls">
         <label class="simplerp-field">
           <span>모델</span>
@@ -7269,29 +7286,33 @@ button[aria-pressed=true], .simplerp-active {
     openAPISettings() {
       const controller = this.controller;
       const settings = clone(controller.api.settings || {
-        provider: 'firebase-ai-logic', model: AI_MODELS[0].id, reasoning: AI_MODELS[0].default,
+        provider: 'firebase-ai-logic', model: DEFAULT_AI_MODEL.id, reasoning: DEFAULT_AI_MODEL.default,
         firebaseConfig: {}, debugToken: ''
       });
       let context;
+      const readSettings = async () => {
+        const token = context.body.querySelector('[data-ai-token]').value.trim();
+        if (!token) {
+          return null;
+        }
+        const source = context.body.querySelector('[data-ai-config]').value.trim().replace(/^(?:const|let|var)\s+firebaseConfig\s*=\s*/, '').replace(/;\s*$/, '').replace(/(^|[{,]\s*)([a-zA-Z][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
+        const input = await JsonWork.run('parse', source);
+        const validator = new SchemaValidator();
+        const firebaseConfig = {};
+        for (const key of ['apiKey', 'projectId', 'appId']) {
+          validator.string(input[key], key, true);
+          firebaseConfig[key] = input[key].trim();
+        }
+        return { provider: 'firebase-ai-logic', model: settings.model, reasoning: settings.reasoning, firebaseConfig, debugToken: token };
+      };
       context = this.modal('자동구축 API 설정', `<label class="simplerp-field"><span>제공업체</span><select aria-label="제공업체"><option>Firebase AI Logic (Vertex AI)</option></select></label>
         <div data-model-controls>${this.modelControls(settings)}</div>
         <div class="simplerp-toolbar"><strong>Firebase AI Logic</strong><button type="button" data-ai-guide>연동 가이드</button></div>
         <label class="simplerp-field"><span>Firebase config</span><textarea rows="5" data-ai-config spellcheck="false"></textarea></label>
-        <label class="simplerp-field"><span>App Check 디버그 토큰</span><input type="password" data-ai-token autocomplete="off" spellcheck="false"></label>`, [
+        <label class="simplerp-field"><span>App Check 디버그 토큰</span><input type="password" data-ai-token autocomplete="off" spellcheck="false"></label>
+        <div class="simplerp-toolbar"><button type="button" data-ai-test>연결 테스트</button><small data-ai-test-status role="status">짧은 AI 요청 · 요금 발생 가능</small></div>`, [
         ['닫기', () => this.closeModal(context)], ['저장', async () => {
-          const token = context.body.querySelector('[data-ai-token]').value.trim();
-          let next = null;
-          if (token) {
-            const source = context.body.querySelector('[data-ai-config]').value.trim().replace(/^(?:const|let|var)\s+firebaseConfig\s*=\s*/, '').replace(/;\s*$/, '').replace(/(^|[{,]\s*)([a-zA-Z][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
-            const input = await JsonWork.run('parse', source);
-            const validator = new SchemaValidator();
-            const firebaseConfig = {};
-            for (const key of ['apiKey', 'projectId', 'appId']) {
-              validator.string(input[key], key, true);
-              firebaseConfig[key] = input[key].trim();
-            }
-            next = { provider: 'firebase-ai-logic', model: settings.model, reasoning: settings.reasoning, firebaseConfig, debugToken: token };
-          }
+          const next = await readSettings();
           controller.api.save(next);
           controller.auto.initialized = false;
           controller.auto.warning = '';
@@ -7304,6 +7325,30 @@ button[aria-pressed=true], .simplerp-active {
       context.body.querySelector('[data-ai-token]').value = settings.debugToken;
       this.bindModelControls(context.body, settings);
       context.body.querySelector('[data-ai-guide]').addEventListener('click', () => this.openAIGuide());
+      // 연결 테스트는 입력 중인 설정으로만 실행하며 저장된 API 설정을 변경하지 않는다.
+      const testAbort = new AbortController();
+      context.cleanups.push(() => testAbort.abort());
+      context.body.querySelector('[data-ai-test]').addEventListener('click', () => this.run(async () => {
+        const controls = [...context.body.querySelectorAll('input, textarea, select, button')];
+        const status = context.body.querySelector('[data-ai-test-status]');
+        controls.forEach(control => { control.disabled = true; });
+        status.textContent = '연결 확인 중';
+        try {
+          const next = await readSettings();
+          if (!next) {
+            throw new SimpleRPError('App Check 디버그 토큰을 입력하세요.');
+          }
+          await new FirebaseAIClient(next).generate('연결 확인입니다. {"ok":true}만 JSON으로 응답하세요.', next, testAbort.signal, { testConnection: true });
+          status.textContent = '연결 성공';
+        } catch (error) {
+          if (!testAbort.signal.aborted) {
+            status.textContent = '연결 실패';
+            throw error;
+          }
+        } finally {
+          controls.forEach(control => { control.disabled = false; });
+        }
+      }));
     }
     openAIGuide() {
       const context = this.modal('Firebase AI Logic 연동 가이드', `<div class="simplerp-connection-guide">
@@ -7379,8 +7424,7 @@ button[aria-pressed=true], .simplerp-active {
       const current = prepared.lastTurn;
       const from = full ? 1 : Math.min(current, last + 1);
       context.body.innerHTML = `<section class="simplerp-help-section"><h4>${full ? '전체구축' : '이어서구축'}</h4><dl><dt>마지막 구축</dt><dd>${last}턴</dd><dt>현재</dt><dd>${current}턴</dd><dt>포함 로그</dt><dd>${from}~${current}턴 · 최신 ${Math.max(0, current - from + 1)}턴, 현재 턴 포함</dd></dl></section>
-        <section class="simplerp-help-section"><h4>AI 요청</h4><dl><dt>구축</dt><dd>${full ? '전체 로그로 새 기억 구축' : '저장된 기억과 이후 로그로 갱신'}</dd><dt>압축</dt><dd>주입 예정량 초과 시 1회 추가 요청</dd><dt>저장</dt><dd>검사 성공 시 자동저장·주입 갱신</dd><dt>비용</dt><dd>구축·압축 각각 요청 비용 발생 가능</dd></dl></section><div data-model-controls>${this.modelControls(settings)}</div>`;
-      this.bindModelControls(context.body, settings);
+        <section class="simplerp-help-section"><h4>AI 요청</h4><dl><dt>모델</dt><dd>${html(AI_MODELS.find(model => model.id === settings.model)?.name || settings.model)}</dd><dt>추론</dt><dd>${html(REASONING_LABELS[settings.reasoning])}</dd><dt>구축</dt><dd>${full ? '전체 로그로 새 기억 구축' : '저장된 기억과 이후 로그로 갱신'}</dd><dt>압축</dt><dd>주입 예정량 초과 시 1회 추가 요청</dd><dt>저장</dt><dd>검사 성공 시 자동저장·주입 갱신</dd><dt>비용</dt><dd>구축·압축 각각 요청 비용 발생 가능</dd></dl></section>`;
       const run = document.createElement('button');
       run.className = 'simplerp-btn simplerp-primary';
       run.textContent = '요청';
@@ -7451,8 +7495,16 @@ button[aria-pressed=true], .simplerp-active {
         }
         const data = await controller.autoStore.read('historyData', selectedId);
         if (button.dataset.historyDownload) {
-          const content = data.after ?? { error: meta.error || '응답 수신 전 중지됨' };
-          downloadText(typeof content === 'string' ? content : await JsonWork.run('stringify', content), `SimpleRP-build-${meta.createdAt}.json`, 'application/json;charset=utf-8');
+          const download = this.modal('JSON 다운로드', `<div class="simplerp-toolbar"><button type="button" data-history-snapshot="before" ${data?.before == null ? 'disabled' : ''}>적용 전</button><button type="button" data-history-snapshot="after" ${data?.after == null ? 'disabled' : ''}>적용 후</button></div>`, []);
+          download.footer.remove();
+          download.body.addEventListener('click', event => this.run(async () => {
+            const choice = event.target.closest('[data-history-snapshot]');
+            if (!choice || choice.disabled) {
+              return;
+            }
+            const content = data[choice.dataset.historySnapshot];
+            downloadText(typeof content === 'string' ? content : await JsonWork.run('stringify', content), `SimpleRP-build-${meta.createdAt}-${choice.dataset.historySnapshot}.json`, 'application/json;charset=utf-8');
+          }));
           return;
         }
         if (!data.after || typeof data.after !== 'object' || !data.after.memory) {
