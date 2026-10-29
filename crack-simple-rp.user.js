@@ -2377,7 +2377,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
               } catch {
                 // JSON 오류 응답이 없을 때만 HTTP 상태별 안내를 사용한다.
               }
-              finish(reject, new SimpleRPError(`${service} 요청 실패 (${response.status}).\n${serverMessage || guidance}`, {
+              finish(reject, new SimpleRPError(`${service} 요청 실패 (${response.status}). ${guidance}${serverMessage ? `\n${serverMessage}` : ''}`, {
                 code: 'HTTP',
                 status: response.status,
                 retryAfterMs: Number.isFinite(retryAfterMs) ? Math.max(1000, retryAfterMs) : 30000
@@ -5540,6 +5540,32 @@ button[aria-pressed=true], .simplerp-active {
     color: #b0bdd2;
     overflow-wrap: anywhere;
 }
+.simplerp-run-summary h4 {
+    color: var(--simplerp-accent);
+    font-size: 13px;
+}
+.simplerp-run-summary dl {
+    grid-template-columns: 84px minmax(0, 1fr);
+    gap: 7px 8px;
+}
+.simplerp-run-summary dt {
+    color: var(--simplerp-muted);
+}
+.simplerp-run-summary dd {
+    color: var(--simplerp-text);
+    font-weight: 600;
+}
+.simplerp-run-summary dd small {
+    display: block;
+    color: var(--simplerp-muted);
+    font-size: 11px;
+    font-weight: 400;
+    margin-top: 3px;
+}
+.simplerp-run-summary p {
+    margin: 9px 0 0;
+    color: #e4ba78;
+}
 .simplerp-conflict-warning {
     color: #ffacba;
     line-height: 1.65;
@@ -6099,6 +6125,10 @@ button[aria-pressed=true], .simplerp-active {
                 .simplerp-connection-guide a { color: var(--simplerp-accent); }
                 .simplerp-connection-guide textarea { height: min(240px, 35dvh); font: 11px/1.5 Consolas, monospace; }
                 .simplerp-help-popover { position: fixed; margin: 0; max-height: calc(100dvh - 24px); overflow: auto; background: var(--simplerp-panel); color: var(--simplerp-text); padding: 12px; border: 1px solid var(--simplerp-line); border-radius: 9px; box-shadow: 0 10px 30px #0009; }
+                .simplerp-error-summary { margin:0; overflow-wrap:anywhere; }
+                .simplerp-server-detail { margin-top:10px; padding:10px; border:1px solid var(--simplerp-line); border-radius:6px; background:var(--simplerp-card); }
+                .simplerp-server-detail h4 { margin:0 0 6px; font-size:11px; color:var(--simplerp-muted); }
+                .simplerp-server-detail pre { margin:0; max-height:min(300px,45dvh); overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.6 system-ui,sans-serif; user-select:text; }
                 .simplerp-source-choices { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
                 .simplerp-source-choices button { display: flex; flex-direction: column; gap: 6px; padding: 14px 8px; }
                 .simplerp-source-choices small { font-size: 11px; }
@@ -6296,7 +6326,7 @@ button[aria-pressed=true], .simplerp-active {
       if (this.toast.parentNode !== target) {
         target.append(this.toast);
       }
-      this.toast.textContent = message || '';
+      this.toast.textContent = String(message || '').split('\n', 1)[0];
       this.toast.hidden = !message;
       if (message) {
         this.toastTimer = setTimeout(() => { this.toast.hidden = true; }, 4500);
@@ -7423,8 +7453,20 @@ button[aria-pressed=true], .simplerp-active {
       const last = room.lastBuild.lastTurn;
       const current = prepared.lastTurn;
       const from = full ? 1 : Math.min(current, last + 1);
-      context.body.innerHTML = `<section class="simplerp-help-section"><h4>${full ? '전체구축' : '이어서구축'}</h4><dl><dt>마지막 구축</dt><dd>${last}턴</dd><dt>현재</dt><dd>${current}턴</dd><dt>포함 로그</dt><dd>${from}~${current}턴 · 최신 ${Math.max(0, current - from + 1)}턴, 현재 턴 포함</dd></dl></section>
-        <section class="simplerp-help-section"><h4>AI 요청</h4><dl><dt>모델</dt><dd>${html(AI_MODELS.find(model => model.id === settings.model)?.name || settings.model)}</dd><dt>추론</dt><dd>${html(REASONING_LABELS[settings.reasoning])}</dd><dt>구축</dt><dd>${full ? '전체 로그로 새 기억 구축' : '저장된 기억과 이후 로그로 갱신'}</dd><dt>압축</dt><dd>주입 예정량 초과 시 1회 추가 요청</dd><dt>저장</dt><dd>검사 성공 시 자동저장·주입 갱신</dd><dt>비용</dt><dd>구축·압축 각각 요청 비용 발생 가능</dd></dl></section>`;
+      context.body.innerHTML = `<section class="simplerp-help-section simplerp-run-summary">
+        <h4>구축 범위</h4><dl>
+          <dt>작업</dt><dd>${full ? '전체구축 · 전체 로그로 기억 생성' : '이어서구축 · 기존 기억과 새 로그 통합'}</dd>
+          <dt>마지막 구축</dt><dd>${displayCount(last)}턴</dd>
+          <dt>현재</dt><dd>${displayCount(current)}턴</dd>
+          <dt>전달 로그</dt><dd>${current > 0 ? `${displayCount(from)}~${displayCount(current)}턴 · ${full ? '전체' : '최근'} ${displayCount(current - from + 1)}턴<small>현재 턴 로그 포함</small>` : '로그 없음'}</dd>
+        </dl></section>
+        <section class="simplerp-help-section simplerp-run-summary">
+          <h4>API 요청과 요금</h4><dl>
+            <dt>모델</dt><dd>${html(AI_MODELS.find(model => model.id === settings.model)?.name || settings.model)} / 추론 ${html(REASONING_LABELS[settings.reasoning])}</dd>
+            <dt>구축</dt><dd>AI 요청 1회</dd>
+            <dt>추가 압축</dt><dd>주입 예정량이 40,000자를 넘으면 1회 추가 요청</dd>
+          </dl><p>구축과 추가 압축은 각각 API 요금이 발생합니다.</p>
+        </section>`;
       const run = document.createElement('button');
       run.className = 'simplerp-btn simplerp-primary';
       run.textContent = '요청';
@@ -8641,10 +8683,12 @@ button[aria-pressed=true], .simplerp-active {
       if (issue) {
         popover.innerHTML = this.storageErrorView(issue);
       } else {
-        popover.textContent = this.controller.injection.error || this.persistentError || this.controller.auto.warning || '';
-        popover.style.whiteSpace = 'pre-wrap';
+        const message = this.controller.injection.error || this.persistentError || this.controller.auto.warning || '';
+        const [summary, ...details] = normalizeText(message).split('\n');
+        popover.innerHTML = `<p class="simplerp-error-summary">${html(summary)}</p>${details.length ? `<section class="simplerp-server-detail"><h4>상세 내용</h4><pre>${html(details.join('\n'))}</pre></section>` : ''}`;
       }
-      this.shadow.append(popover);
+      // 모달 내부에 두어 팝업 본문도 클릭·스크롤 가능한 영역에 포함한다.
+      (anchor.closest('dialog') || this.shadow).append(popover);
       this.helpPopover = popover;
       popover.showPopover();
       const position = () => {
