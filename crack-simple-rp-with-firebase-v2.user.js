@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      2.0.0.0
+// @version      2.0.1.3
 // @description  Crack 채팅의 기억을 정리하고 주입해 이야기의 연속성을 유지합니다. 로컬·Firebase 저장과 AI 기억 구축을 지원합니다. (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -13,8 +13,8 @@
 // @connect      contents-api.wrtn.ai
 // @connect      firebaseio.com
 // @connect      firebasedatabase.app
-// @connect      firebaseappcheck.googleapis.com
-// @connect      firebasevertexai.googleapis.com
+// @connect      auth.openai.com
+// @connect      api.openai.com
 // @connect      raw.githubusercontent.com
 // @updateURL    https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js
 // @downloadURL  https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js
@@ -31,7 +31,8 @@
  *    └─ firebaseConfig?: Firebase 웹 앱의 공개 연결 설정
  *       └─ apiKey, databaseURL, projectId, appId
  * Tampermonkey GM
- * └─ simplerp-api: { provider, firebaseConfig: { apiKey, projectId, appId }, debugToken, model, reasoning }
+ * └─ simplerp-siwc: { hostId, activeClientId, accounts[], pending? }
+ *    계정별 검증된 identity·OAuth tokens·모델 목록·모델/추론 선택. DB·백업과 공유하지 않는다.
  * IndexedDB: simplerp-auto-build
  * ├─ roomPreferences/{roomKey}: { enabled }
  * ├─ historyMeta/{id}: roomKey, roomName, createdAt, provider, model, reasoning, mode, outcome, error?
@@ -110,7 +111,7 @@
   const LORE_TYPES = ['세계관', '아이템', '복장', '핵심 대사', '능력', '호칭·말투', '장소', '조직', '세력', '규칙', '인물', '사건', '기타'];
   const KNOWLEDGE_STATES = ['알고 있음', '모름', '추측', '오해', '미확인'];
   const GUIDES = ['full', 'continue', 'compress'];
-  const API_SETTINGS_KEY = 'simplerp-api';
+  const SIWC_KEY = 'simplerp-siwc';
   const MIGRATION_BASE_URL = 'https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/src/migrations/';
   const MIGRATIONS = { 1: { file: 'schema-v2.js', hash: 'c5deb4513409882dd0cd5fce2ebc197ee37b0eaf179217cda8521009e2b59df1' } };
   const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
@@ -2920,14 +2921,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
   }
 
   // ── 기기 전용 자동구축 자료: Firebase DB·DB 인증과 공유하지 않는다. ──
-  const AI_MODELS = [
-    { id: 'gemini-4-argon', name: 'Gemini 4 Argon', levels: ['low', 'medium', 'high'], default: 'medium', maxOutputTokens: 32768 },
-    { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', levels: ['low', 'medium', 'high'], default: 'medium' },
-    { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', levels: ['low', 'medium', 'high'], default: 'medium' },
-    { id: 'gemini-3.1-pro-preview', name: 'gemini-3.1-pro-preview', levels: ['low', 'medium', 'high'], default: 'high' }
-  ];
-  const DEFAULT_AI_MODEL = AI_MODELS.find(model => model.id === 'gemini-3.8-flash');
-  const REASONING_LABELS = { minimal: '최소', low: '낮음', medium: '보통', high: '높음' };
+  const REASONING_LABELS = { default: '모델 기본값', none: '없음', minimal: '최소', low: '낮음', medium: '보통', high: '높음', xhigh: '매우 높음', max: '최대', ultra: 'Ultra' };
   const GUIDE_LABELS = { full: '전체구축', continue: '이어서구축', compress: '압축' };
   class AutoBuildStore {
     open() {
@@ -3011,87 +3005,382 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       });
     }
   }
-  class FirebaseAIClient {
-    constructor(settings = GM_getValue(API_SETTINGS_KEY, null)) {
-      this.settings = settings;
-      this.token = null;
-      this.pendingToken = null;
-    }
-    save(settings) {
-      GM_setValue(API_SETTINGS_KEY, settings);
-      this.settings = settings ? clone(settings) : null;
-      this.token = null;
-      this.pendingToken = null;
-    }
-    async appCheck(settings, signal) {
-      const credentials = { firebaseConfig: settings.firebaseConfig, debugToken: settings.debugToken };
-      if (this.token && equal(credentials, this.token.credentials) && this.token.expiresAt > Date.now() + 30000) {
-        return this.token.value;
+  const SIWC_ISSUER = 'https://auth.openai.com';
+  const SIWC_RESOURCE = 'https://api.openai.com/v1';
+  const SIWC_CALLBACK = 'http://127.0.0.1:1455/auth/callback';
+  const SIWC_SCOPE = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct';
+  const siwcEncode = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const siwcDecode = value => Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0));
+  const siwcRandom = () => siwcEncode(crypto.getRandomValues(new Uint8Array(32)));
+  function siwcError(status, text, headers = '') {
+    let data;
+    try { data = JSON.parse(text); } catch { data = {}; }
+    const code = typeof data.error === 'string' ? data.error : data.error?.code || data.code || 'HTTP';
+    const requestId = /^(?:x-request-id|openai-request-id):\s*(.+)$/im.exec(headers)?.[1]?.trim();
+    const message = data.error?.message || data.error_description || data.detail || 'OpenAI 요청을 완료하지 못했습니다.';
+    // 서버 진단에도 자격정보가 되돌아올 수 있다. 원문 응답/URL은 이력에 남기지 않는다.
+    const safe = String(message).replace(/https?:\/\/\S+/g, '[URL]').replace(/\beyJ[A-Za-z0-9_.-]+/g, '[TOKEN]').slice(0, 1200);
+    return new SimpleRPError(`OpenAI (${status}, ${code}) ${safe}${requestId ? `\nRequest ID: ${requestId}` : ''}`, { code, status, requestId });
+  }
+  // DB용 통신은 유지하고, SIWC만 쿠키 없는 요청과 SSE 읽기를 사용한다.
+  function siwcHttp(path, { method = 'GET', body, token, signal, onText, timeout = 30000 } = {}) {
+    return new Promise((resolve, reject) => {
+      let handle;
+      let settled = false;
+      let received = 0;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
+        error ? reject(error) : resolve(value);
+      };
+      const stop = error => {
+        finish(error);
+        handle?.abort();
+      };
+      const abort = () => stop(new SimpleRPError('요청을 중지했습니다.', { code: 'CANCELLED' }));
+      const timer = setTimeout(() => stop(new SimpleRPError('OpenAI 요청 시간 초과. 자동 재전송하지 않았습니다.', { code: 'NETWORK' })), timeout);
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener('abort', abort, { once: true });
+      const url = new URL(path);
+      if (![SIWC_ISSUER, 'https://api.openai.com'].includes(url.origin)) {
+        finish(new SimpleRPError('공식 OpenAI 서버만 사용할 수 있습니다.'));
+        return;
       }
-      if (!this.pendingToken || this.pendingToken.signal.aborted || !equal(credentials, this.pendingToken.credentials)) {
-        const pending = { credentials, signal };
-        pending.promise = (async () => {
-          const config = settings.firebaseConfig;
-          const response = await privilegedHttp({
-            method: 'POST', service: 'AI 인증', signal,
-            url: `https://firebaseappcheck.googleapis.com/v1/projects/${encodeURIComponent(config.projectId)}/apps/${encodeURIComponent(config.appId)}:exchangeDebugToken?key=${encodeURIComponent(config.apiKey)}`,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ debugToken: settings.debugToken })
-          });
-          const data = JSON.parse(response.text);
-          const lifetime = Number.parseFloat(data.ttl);
-          if (!data.token || !Number.isFinite(lifetime)) {
-            throw new SimpleRPError('AI App Check 토큰 응답을 확인할 수 없습니다.');
-          }
-          if (!signal.aborted && this.settings && equal(credentials, { firebaseConfig: this.settings.firebaseConfig, debugToken: this.settings.debugToken })) {
-            this.token = { credentials, value: data.token, expiresAt: Date.now() + lifetime * 1000 };
-          }
-          return data.token;
-        })().finally(() => {
-          if (this.pendingToken === pending) {
-            this.pendingToken = null;
-          }
+      const complete = (response, text) => {
+        if (response.finalUrl && new URL(response.finalUrl).origin !== url.origin) {
+          finish(new SimpleRPError('다른 서버로 이동한 OpenAI 응답은 허용하지 않습니다.'));
+        } else if (response.status < 200 || response.status >= 300) {
+          finish(siwcError(response.status, text, response.responseHeaders));
+        } else {
+          finish(null, onText ? {
+            status: response.status, characters: Math.max(received, text.length),
+            contentType: /^content-type:\s*([^\r\n;]+)/im.exec(response.responseHeaders || '')?.[1]?.trim() || '없음',
+            requestId: /^(?:x-request-id|openai-request-id):\s*([^\r\n]+)/im.exec(response.responseHeaders || '')?.[1]?.trim() || '없음'
+          } : text);
+        }
+      };
+      const responseText = response => typeof response.responseText === 'string' && response.responseText
+        ? response.responseText : typeof response.response === 'string' ? response.response : '';
+      const readText = response => {
+        if (settled || !onText || response.status < 200 || response.status >= 300) return;
+        const text = responseText(response);
+        if (text.length > received) {
+          const chunk = text.slice(received);
+          received = text.length;
+          onText(chunk);
+        }
+      };
+      try {
+        handle = GM_xmlhttpRequest({
+          method, url: url.href, data: body, anonymous: true, redirect: 'error', timeout,
+          headers: {
+            Accept: onText ? 'text/event-stream' : 'application/json',
+            ...(body ? { 'Content-Type': token ? 'application/json' : 'application/x-www-form-urlencoded' } : {}),
+            ...(token ? { Authorization: `Bearer ${token}` } : {})
+          },
+          // SSE는 일반 텍스트로 받는다. 별도의 ReadableStream 읽기 루프를 돌리지 않는다.
+          onprogress(response) {
+            try { readText(response); }
+            catch (error) { stop(error instanceof SimpleRPError ? error : new SimpleRPError('OpenAI 응답 형식을 읽지 못했습니다.')); }
+          },
+          onload(response) {
+            if (settled) return;
+            try {
+              // progress를 제공하지 않는 환경에서도 최종 응답을 빠짐없이 처리한다.
+              readText(response);
+              complete(response, responseText(response));
+            } catch (error) { stop(error instanceof SimpleRPError ? error : new SimpleRPError('OpenAI 응답 형식을 읽지 못했습니다.')); }
+          },
+          ontimeout() { stop(new SimpleRPError('OpenAI 요청 시간 초과. 자동 재전송하지 않았습니다.', { code: 'NETWORK' })); },
+          onerror() { finish(new SimpleRPError('OpenAI 네트워크 연결 실패. 권한과 네트워크를 확인하세요.', { code: 'NETWORK' })); },
+          onabort() { finish(new SimpleRPError('OpenAI 요청이 중단됐습니다.', { code: 'CANCELLED' })); }
         });
-        this.pendingToken = pending;
+      } catch {
+        finish(new SimpleRPError('OpenAI 요청을 시작하지 못했습니다. Tampermonkey 네트워크 권한을 확인하세요.'));
       }
-      return this.pendingToken.promise;
+    });
+  }
+  class ChatGPTClient {
+    constructor() {
+      // 이전 AI 설정만 지운다. Firebase DB 설정·로그인·기억·이력은 변경하지 않는다.
+      if (GM_getValue('simplerp-api', null) !== null) GM_setValue('simplerp-api', null);
+      this.jwks = null;
     }
-    async generate(text, settings, signal, { testConnection = false } = {}) {
-      const model = AI_MODELS.find(item => item.id === settings?.model);
-      if (!model || !model.levels.includes(settings.reasoning)) {
-        throw new SimpleRPError('API 설정에서 모델과 추론을 선택하세요.');
-      }
-      const token = await this.appCheck(settings, signal);
-      if (signal.aborted) {
-        throw new SimpleRPError('요청을 중지했습니다.', { code: 'CANCELLED' });
-      }
-      const config = settings.firebaseConfig;
-      const response = await privilegedHttp({
-        method: 'POST', service: 'Firebase AI Logic', signal, timeout: testConnection ? 30000 : 180000,
-        url: `https://firebasevertexai.googleapis.com/v1beta/projects/${encodeURIComponent(config.projectId)}/locations/global/publishers/google/models/${encodeURIComponent(model.id)}:generateContent`,
-        headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': config.apiKey, 'X-Firebase-AppCheck': token },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            maxOutputTokens: testConnection ? 256 : (model.maxOutputTokens ?? 65536),
-            thinkingConfig: { thinkingLevel: settings.reasoning.toUpperCase() }
-          }
-        })
+    read() {
+      return GM_getValue(SIWC_KEY, { hostId: '', activeClientId: '', accounts: [], pending: null });
+    }
+    write(state) { GM_setValue(SIWC_KEY, state); }
+    lock(operation, signal) {
+      if (!navigator.locks) throw new SimpleRPError('안전한 토큰 갱신에 필요한 Web Locks를 지원하는 최신 브라우저를 사용하세요.');
+      const waiting = new AbortController();
+      const cancel = () => waiting.abort();
+      const timer = setTimeout(cancel, 30000);
+      if (signal?.aborted) cancel();
+      else signal?.addEventListener('abort', cancel, { once: true });
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', cancel); };
+      return navigator.locks.request('simplerp-siwc', { signal: waiting.signal }, () => {
+        cleanup();
+        return operation();
+      }).catch(error => {
+        if (waiting.signal.aborted) throw new SimpleRPError(signal?.aborted ? '요청을 중지했습니다.' : '다른 탭의 ChatGPT 연결 작업을 기다리다 시간 초과됐습니다.', { code: signal?.aborted ? 'CANCELLED' : 'NETWORK' });
+        throw error;
+      }).finally(cleanup);
+    }
+    get account() {
+      const state = this.read();
+      return state.accounts.find(account => account.clientId === state.activeClientId);
+    }
+    get models() { return this.account?.models || []; }
+    get settings() {
+      const account = this.account;
+      return account?.tokens?.access_token && account.scopes?.includes('chatgpt.tokens.use.direct') && account.model
+        ? { provider: 'openai-siwc', clientId: account.clientId, model: account.model, reasoning: account.reasoning || 'default' } : null;
+    }
+    async save(settings) {
+      await this.lock(() => {
+        const state = this.read();
+        const account = state.accounts.find(item => item.clientId === settings.clientId);
+        const model = account?.models?.find(item => item.id === settings.model);
+        if (!account?.tokens || !model?.levels.includes(settings.reasoning)) throw new SimpleRPError('로그인한 계정의 모델·추론을 선택하세요.');
+        account.model = settings.model;
+        account.reasoning = settings.reasoning;
+        this.write(state);
       });
-      const envelope = JSON.parse(response.text);
-      const candidate = envelope.candidates?.[0];
-      if (testConnection && candidate?.finishReason === 'MAX_TOKENS') {
-        return '';
+    }
+    async begin() {
+      return this.lock(async () => {
+        const state = this.read();
+        if (!state.hostId) state.hostId = `urn:uuid:${crypto.randomUUID()}`;
+        const clientId = state.activeClientId || (state.pending?.consumed ? state.pending.clientId : '');
+        const account = state.accounts.find(item => item.clientId === clientId);
+        const pending = {
+          state: siwcRandom(), nonce: siwcRandom(), verifier: siwcRandom(),
+          clientId: account?.clientId || 'dynamic_agent_client', subject: account?.subject,
+          redirectUri: SIWC_CALLBACK, expiresAt: Date.now() + 10 * 60000
+        };
+        const challenge = siwcEncode(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pending.verifier)));
+        const query = new URLSearchParams({
+          client_id: pending.clientId, ext_agent_host_id: state.hostId, response_type: 'code',
+          redirect_uri: pending.redirectUri, scope: SIWC_SCOPE, resource: SIWC_RESOURCE,
+          state: pending.state, nonce: pending.nonce, code_challenge_method: 'S256', code_challenge: challenge
+        });
+        if (account) {
+          if (account.email) query.set('login_hint', account.email);
+          if (!account.scopes?.includes('chatgpt.tokens.use.direct')) query.set('prompt', 'consent');
+        } else query.set('agent_name_hint', 'SimpleRP');
+        state.pending = pending;
+        this.write(state);
+        return `${SIWC_ISSUER}/api/accounts/authorize?${query}`;
+      });
+    }
+    async verifyIdentity(token, clientId, nonce, signal) {
+      try {
+        const parts = token.split('.');
+        if (parts.length !== 3) throw new Error();
+        const parse = part => JSON.parse(new TextDecoder().decode(siwcDecode(part)));
+        const header = parse(parts[0]);
+        if (header.alg !== 'RS256' || !header.kid || header.crit) throw new Error();
+        if (!this.jwks || this.jwksExpiresAt < Date.now() || !this.jwks.keys.some(key => key.kid === header.kid)) {
+          this.jwks = JSON.parse(await siwcHttp(`${SIWC_ISSUER}/.well-known/jwks.json`, { signal }));
+          this.jwksExpiresAt = Date.now() + 3600000;
+        }
+        const keys = this.jwks.keys.filter(key => key.kid === header.kid && key.kty === 'RSA' && (!key.use || key.use === 'sig') && (!key.alg || key.alg === 'RS256'));
+        if (keys.length !== 1) throw new Error();
+        const key = await crypto.subtle.importKey('jwk', keys[0], { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, siwcDecode(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`))) throw new Error();
+        const claims = parse(parts[1]);
+        const now = Date.now() / 1000;
+        const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+        if (claims.iss !== SIWC_ISSUER || !audience.includes(clientId) ||
+            (audience.length > 1 && claims.azp !== clientId) || (claims.azp && claims.azp !== clientId) ||
+            !Number.isFinite(claims.exp) || claims.exp <= now - 5 || !Number.isFinite(claims.iat) || claims.iat > now + 5 ||
+            (claims.nbf !== undefined && (!Number.isFinite(claims.nbf) || claims.nbf > now + 5)) ||
+            typeof claims.sub !== 'string' || !claims.sub || (nonce !== undefined && claims.nonce !== nonce)) throw new Error();
+        return claims;
+      } catch (error) {
+        if (error instanceof SimpleRPError) throw error;
+        throw new SimpleRPError('OpenAI ID Token의 서명·계정·클레임을 검증하지 못했습니다. 다시 로그인하세요.');
       }
-      if (candidate?.finishReason && candidate.finishReason !== 'STOP') {
-        throw new SimpleRPError(`AI 응답을 적용하지 않았습니다 (${candidate.finishReason}). 모델 한도·응답 차단 여부를 확인하세요.`);
+    }
+    async credentials(data, clientId, { nonce, subject, previous, signal } = {}) {
+      if (typeof data.access_token !== 'string' || !data.access_token || typeof data.refresh_token !== 'string' || !data.refresh_token ||
+          data.token_type?.toLowerCase() !== 'bearer' || !Number.isFinite(data.expires_in) || data.expires_in <= 0 || typeof data.scope !== 'string') {
+        throw new SimpleRPError('OpenAI 토큰 응답의 필수 항목을 확인하지 못했습니다. 다시 로그인하세요.');
       }
-      const result = candidate?.content?.parts?.filter(part => !part.thought).map(part => part.text || '').join('');
-      if (!result?.trim()) {
-        throw new SimpleRPError('AI가 사용할 수 있는 JSON 응답을 반환하지 않았습니다.');
+      const identity = data.id_token ? await this.verifyIdentity(data.id_token, clientId, nonce, signal) : null;
+      if ((!previous && !identity) || (identity && subject && identity.sub !== subject)) throw new SimpleRPError('로그인한 ChatGPT 계정이 선택한 계정과 다릅니다.');
+      return {
+        subject: identity?.sub || subject, email: identity?.email || previous?.email || '', issuer: SIWC_ISSUER,
+        scopes: data.scope.split(/\s+/).filter(Boolean), expiresAt: Date.now() + data.expires_in * 1000,
+        tokens: { access_token: data.access_token, refresh_token: data.refresh_token, id_token: data.id_token || previous?.tokens.id_token }
+      };
+    }
+    async complete(value, signal) {
+      return this.lock(async () => {
+        const state = this.read();
+        const pending = state.pending;
+        if (!pending || pending.consumed || pending.expiresAt < Date.now()) throw new SimpleRPError('로그인 시도가 없거나 만료됐습니다. 다시 시작하세요.');
+        let callback;
+        try { callback = new URL(value); } catch { throw new SimpleRPError('주소창의 전체 콜백 URL을 붙여 넣으세요.'); }
+        const expected = new URL(pending.redirectUri);
+        const query = callback.searchParams;
+        if (callback.origin !== expected.origin || callback.pathname !== expected.pathname || callback.username || callback.password || callback.hash ||
+            ['state', 'code', 'client_id', 'error'].some(key => query.getAll(key).length > 1) || query.get('state') !== pending.state) {
+          throw new SimpleRPError('콜백 주소 또는 state가 현재 로그인 시도와 다릅니다.');
+        }
+        if (query.has('error')) {
+          state.pending = null;
+          this.write(state);
+          throw new SimpleRPError('ChatGPT 승인이 완료되지 않았습니다. 다시 로그인하세요.');
+        }
+        const issued = query.get('client_id');
+        const clientId = pending.clientId === 'dynamic_agent_client' ? issued : pending.clientId;
+        if (!clientId || clientId === 'dynamic_agent_client' || (issued && issued !== clientId) || !query.get('code')) throw new SimpleRPError('인증 코드 또는 발급된 client_id가 올바르지 않습니다.');
+        let account = state.accounts.find(item => item.clientId === clientId);
+        // 코드는 한 번만 사용한다. 교환 실패 시에도 발급된 client ID는 재로그인에 사용한다.
+        if (!account) { account = { clientId, models: [] }; state.accounts.push(account); }
+        pending.consumed = true;
+        pending.clientId = clientId;
+        this.write(state);
+        const body = new URLSearchParams({ grant_type: 'authorization_code', client_id: clientId, code: query.get('code'), code_verifier: pending.verifier, redirect_uri: pending.redirectUri, resource: SIWC_RESOURCE });
+        const data = JSON.parse(await siwcHttp(`${SIWC_ISSUER}/api/accounts/oauth/token`, { method: 'POST', body: body.toString(), signal }));
+        const verified = await this.credentials(data, clientId, { nonce: pending.nonce, subject: pending.subject || account.subject, signal });
+        Object.assign(account, verified);
+        state.activeClientId = clientId;
+        state.pending = null;
+        this.write(state);
+      });
+    }
+    async accessToken(clientId, signal) {
+      return this.lock(async () => {
+        const state = this.read();
+        const account = state.accounts.find(item => item.clientId === clientId);
+        if (!account?.tokens || !account.scopes.includes('chatgpt.tokens.use.direct')) throw new SimpleRPError('ChatGPT에 로그인하고 구독 사용 권한을 승인하세요.');
+        if (signal?.aborted) throw new SimpleRPError('요청을 중지했습니다.', { code: 'CANCELLED' });
+        if (account.expiresAt > Date.now() + 30000) return account.tokens.access_token;
+        try {
+          // 토큰 회전이 시작되면 UI 중지와 무관하게 교환·저장을 끝낸다. 재전송은 하지 않는다.
+          const body = new URLSearchParams({ grant_type: 'refresh_token', client_id: clientId, refresh_token: account.tokens.refresh_token, resource: SIWC_RESOURCE });
+          const data = JSON.parse(await siwcHttp(`${SIWC_ISSUER}/api/accounts/oauth/token`, { method: 'POST', body: body.toString() }));
+          Object.assign(account, await this.credentials(data, clientId, { subject: account.subject, previous: account }));
+          this.write(state);
+          if (!account.scopes.includes('chatgpt.tokens.use.direct')) throw new SimpleRPError('ChatGPT 구독 사용 권한이 없습니다. 다시 승인하세요.');
+          return account.tokens.access_token;
+        } catch (error) {
+          if (['invalid_grant', 'invalid_refresh_token', 'token_expired', 'refresh_token_expired', 'refresh_token_invalidated', 'refresh_token_reused'].includes(error.code)) {
+            delete account.tokens;
+            this.write(state);
+          }
+          throw error;
+        }
+      }, signal);
+    }
+    async loadModels(signal) {
+      const clientId = this.account?.clientId;
+      const token = await this.accessToken(clientId, signal);
+      const data = JSON.parse(await siwcHttp(`${SIWC_RESOURCE}/models`, { token, signal }));
+      if (!Array.isArray(data.models)) throw new SimpleRPError('OpenAI 계정 모델 목록 형식을 확인하지 못했습니다.');
+      const models = data.models.filter(item => item.visibility === 'list' && typeof item.slug === 'string').map(item => ({
+        id: item.slug, name: item.display_name || item.slug, default: 'default',
+        levels: ['default', ...new Set((item.supported_reasoning_levels || []).map(level => typeof level === 'string' ? level : level.effort).filter(level => level !== 'default' && Object.hasOwn(REASONING_LABELS, level)))]
+      }));
+      if (!models.length) throw new SimpleRPError('이 ChatGPT 계정에서 사용할 수 있는 모델이 없습니다.');
+      await this.lock(() => {
+        const state = this.read();
+        const account = state.accounts.find(item => item.clientId === clientId);
+        if (!account?.tokens || state.activeClientId !== clientId) throw new SimpleRPError('모델 조회 중 ChatGPT 연결이 변경됐습니다.');
+        account.models = models;
+        if (!models.some(model => model.id === account.model)) account.model = models[0].id;
+        if (!models.find(model => model.id === account.model).levels.includes(account.reasoning)) account.reasoning = 'default';
+        this.write(state);
+      });
+    }
+    async signOut() {
+      return this.lock(async () => {
+        const state = this.read();
+        const account = state.accounts.find(item => item.clientId === state.activeClientId);
+        let confirmed = !account?.tokens?.refresh_token;
+        if (!confirmed) {
+          try {
+            const body = new URLSearchParams({ token: account.tokens.refresh_token, token_type_hint: 'refresh_token', client_id: account.clientId });
+            await siwcHttp(`${SIWC_ISSUER}/api/accounts/oauth/revoke`, { method: 'POST', body: body.toString() });
+            confirmed = true;
+          } catch { /* 로컬 해제 후 원격 해제 미확인을 알린다. */ }
+        }
+        if (account) delete account.tokens;
+        state.activeClientId = '';
+        state.pending = null;
+        this.write(state);
+        return confirmed;
+      });
+    }
+    async generate(text, settings, signal, { testConnection = false, onStatus = () => {} } = {}) {
+      const state = this.read();
+      const model = state.accounts.find(account => account.clientId === settings.clientId)?.models?.find(item => item.id === settings.model);
+      if (!model?.levels.includes(settings.reasoning)) throw new SimpleRPError('API 설정에서 계정의 모델과 추론을 선택하세요.');
+      onStatus('인증 확인 중…');
+      const token = await this.accessToken(settings.clientId, signal);
+      let buffer = '';
+      let receiving = false;
+      let completed = false;
+      let output = '';
+      const textParts = new Map();
+      const eventTypes = [];
+      const failure = message => new SimpleRPError(`${testConnection ? '연결 테스트' : 'AI 요청'} 실패: ${message}`);
+      const event = block => {
+        const lines = block.replace(/^\uFEFF/, '').split(/\r\n|\r|\n/);
+        const value = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+        if (!value || value === '[DONE]') return;
+        const data = JSON.parse(value);
+        const type = data.type || lines.find(line => line.startsWith('event:'))?.slice(6).trim();
+        eventTypes.push(/^(?:response\.[a-z_.]+|error)$/.test(type) ? type : '알 수 없음');
+        if (eventTypes.length > 5) eventTypes.shift();
+        if (type === 'response.failed' || type === 'error') throw siwcError(200, JSON.stringify({ error: data.response?.error || data.error || data }));
+        if (type === 'response.incomplete') throw failure('OpenAI 응답이 미완료 상태로 종료됐습니다.');
+        if (type === 'response.output_text.delta' || type === 'response.output_text.done') {
+          const key = `${data.output_index}:${data.content_index}`;
+          if (type === 'response.output_text.delta' && typeof data.delta === 'string') textParts.set(key, (textParts.get(key) || '') + data.delta);
+          if (type === 'response.output_text.done' && typeof data.text === 'string') textParts.set(key, data.text);
+        }
+        if (type === 'response.completed') {
+          if (data.response?.status !== 'completed') throw failure('OpenAI 응답의 완료 상태가 올바르지 않습니다.');
+          completed = true;
+          output = (data.response.output || []).filter(item => item.type === 'message' && item.role === 'assistant')
+            .flatMap(item => item.content || []).filter(item => item.type === 'output_text').map(item => item.text).join('');
+        }
+      };
+      onStatus('응답 대기 중…');
+      const response = await siwcHttp(`${SIWC_RESOURCE}/responses`, {
+        method: 'POST', token, signal, timeout: testConnection ? 60000 : 180000,
+        body: JSON.stringify({ model: settings.model, input: [{ role: 'user', content: text }], store: false, stream: true,
+          ...(settings.reasoning !== 'default' ? { reasoning: { effort: settings.reasoning } } : {}) }),
+        onText(chunk) {
+          if (!receiving) { receiving = true; onStatus('응답 수신 중…'); }
+          buffer += chunk;
+          // SSE 구분자가 청크 경계에서 나뉘거나 CRLF인 경우도 처리한다.
+          let match;
+          while ((match = /\r?\n\r?\n|\r\r/.exec(buffer))) {
+            event(buffer.slice(0, match.index));
+            buffer = buffer.slice(match.index + match[0].length);
+          }
+        }
+      });
+      if (buffer.trim()) event(buffer);
+      if (!output.trim()) {
+        output = [...textParts.entries()].sort(([left], [right]) => {
+          const [leftOutput, leftContent] = left.split(':').map(Number);
+          const [rightOutput, rightContent] = right.split(':').map(Number);
+          return leftOutput - rightOutput || leftContent - rightContent;
+        }).map(([, value]) => value).join('');
       }
-      return result.trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+      if (!completed || !output.trim()) {
+        const reason = !response.characters ? '응답 본문이 비어 있습니다.'
+          : !completed ? '응답 완료 이벤트를 받지 못했습니다.' : '응답은 완료됐지만 텍스트가 없습니다.';
+        throw failure(`${reason}\nHTTP ${response.status} · ${response.contentType} · 수신 ${response.characters}자\n이벤트: ${eventTypes.join(' → ') || '없음'}\nRequest ID: ${response.requestId}`);
+      }
+      return output.trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
     }
   }
 
@@ -3759,7 +4048,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       this.knownCarrierIds = new Set();
       this.ui = null;
       this.autoStore = new AutoBuildStore();
-      this.api = new FirebaseAIClient();
+      this.api = new ChatGPTClient();
       this.auto = { enabled: false, job: null, warning: '', initialized: false, due: false, observedTotal: null, attemptedTarget: null };
       this.repository.onNotice = error => this.ui?.showError(error);
       // 메시지 소속 ID는 분기에서 달라질 수 있다. 이벤트는 재조회 신호일 뿐이며
@@ -4050,7 +4339,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           const { before: previous, after, ...status } = entry;
           await this.autoStore.add({
             id: newId('build'), roomKey: identity.roomKey, roomName: before.meta.name,
-            createdAt: Date.now(), provider: 'firebase-ai-logic', model: apiSettings.model,
+            createdAt: Date.now(), provider: 'openai-siwc', model: apiSettings.model,
             reasoning: apiSettings.reasoning, ...status
           }, { before: previous, ...(after !== undefined ? { after } : {}) }).catch(error => this.ui?.showNotice(errorMessage(error)));
         }
@@ -6218,6 +6507,12 @@ button[aria-pressed=true], .simplerp-active {
                 .simplerp-manual-grid [data-action=import] { grid-column:1/-1; height:31px; background:#2b3549; }
                 .simplerp-model-controls { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr); gap:8px; align-items:end; margin:10px 0; }
                 .simplerp-model-controls select { width:100%; }
+                .simplerp-siwc-heading, .simplerp-siwc-account, .simplerp-siwc-callback { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+                .simplerp-siwc-account > span { min-width:0; overflow-wrap:anywhere; }
+                .simplerp-siwc-account > button, .simplerp-siwc-callback > button { flex-shrink:0; }
+                .simplerp-siwc-callback > input { flex:1; width:0; min-width:0; }
+                .simplerp-siwc-hint { display:block; color:var(--simplerp-muted); font-size:11px; }
+                .simplerp-siwc-status { color:var(--simplerp-muted); font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
                 .simplerp-reasoning { display:flex; height:34px; }
                 .simplerp-reasoning button { flex:1; min-width:0; padding:4px 1px; font-size:11px; }
                 .simplerp-history-bar { display:flex; align-items:center; gap:10px; border-bottom:1px solid var(--simplerp-line); margin-bottom:0; }
@@ -6620,12 +6915,12 @@ button[aria-pressed=true], .simplerp-active {
     buildPanel() {
       const controller = this.controller;
       const status = this.autoStatus();
-      const model = AI_MODELS.find(item => item.id === (controller.auto.job?.settings || controller.api.settings)?.model);
+      const model = controller.api.models.find(item => item.id === (controller.auto.job?.settings || controller.api.settings)?.model);
       const busy = Boolean(controller.auto.job);
       return `<div class="simplerp-build-panel">
         <div class="simplerp-build-heading">자동구축 ${iconButton('help', '자동구축 도움말', 'help', 'data-help="auto-build"')}</div>
         <div class="simplerp-auto-row"><div class="simplerp-auto-model">
-          <div class="simplerp-auto-name" ${controller.api.settings ? 'style="color:#b5a0df"' : ''}>${icon(controller.api.settings ? 'flame' : 'key')}<strong>${html(model?.name || 'API 설정 필요')}</strong></div>
+          <div class="simplerp-auto-name" ${controller.api.settings ? 'style="color:#b5a0df"' : ''}>${icon(controller.api.settings ? 'flame' : 'key')}<strong>${html(model?.name || (controller.api.settings?.model || 'ChatGPT 로그인 필요'))}</strong></div>
           <small>${html(status.text)}</small></div>
           <div class="simplerp-auto-actions">${iconButton('auto-history', '자동구축 이력', 'clock')}${iconButton('auto-run', busy ? '자동구축 중지' : '자동구축 바로실행', busy ? 'stop' : 'play', !controller.api.settings && !busy ? 'disabled' : '')}${switchButton('auto-enabled', '이 방 자동구축', controller.auto.enabled, controller.api.settings || busy ? '' : 'disabled')}</div>
         </div>
@@ -7274,143 +7569,200 @@ button[aria-pressed=true], .simplerp-active {
         context.cleanups.push(() => window.visualViewport?.removeEventListener('resize', fitContentEditor));
       }
     }
-    // ── 기기 전용 API 설정: DB 연결·로그인과 공유하지 않는다. ──
+    // ── 기기 전용 SIWC 설정: DB 연결·로그인과 공유하지 않는다. ──
     modelControls(settings) {
-      const model = AI_MODELS.find(item => item.id === settings.model) || DEFAULT_AI_MODEL;
+      const models = this.controller.api.models;
+      const model = models.find(item => item.id === settings.model) || models[0];
       return `<div class="simplerp-model-controls">
-        <label class="simplerp-field">
-          <span>모델</span>
-          <select data-ai-model>${AI_MODELS.map(item => `<option value="${item.id}" ${item.id === model.id ? 'selected' : ''}>${html(item.name)}</option>`).join('')}</select>
-        </label>
-        <div class="simplerp-field">
-          <span>추론</span>
-          <div class="simplerp-segment simplerp-reasoning" data-ai-reasoning>
-            ${model.levels.map(level => `<button type="button" data-level="${level}" aria-pressed="${level === settings.reasoning}">${REASONING_LABELS[level]}</button>`).join('')}
-          </div>
-        </div>
-      </div>`;
+        <label class="simplerp-field"><span>모델</span><select data-ai-model ${model ? '' : 'disabled'}>
+          ${models.map(item => `<option value="${html(item.id)}" ${item.id === model?.id ? 'selected' : ''}>${html(item.name)}</option>`).join('') || '<option>로그인 후 모델 조회</option>'}
+        </select></label>
+        <div class="simplerp-field"><span>추론</span><div class="simplerp-segment simplerp-reasoning" data-ai-reasoning>
+          ${(model?.levels || ['default']).map(level => `<button type="button" data-level="${level}" aria-pressed="${level === settings.reasoning}" ${model ? '' : 'disabled'}>${REASONING_LABELS[level]}</button>`).join('')}
+        </div></div></div>`;
     }
     bindModelControls(container, settings) {
       const select = container.querySelector('[data-ai-model]');
-      settings.model = select.value;
       const paintReasoning = () => {
-        const model = AI_MODELS.find(item => item.id === settings.model);
-        if (!model.levels.includes(settings.reasoning)) {
-          settings.reasoning = model.default;
-        }
+        const model = this.controller.api.models.find(item => item.id === settings.model);
+        if (!model) return;
+        if (!model.levels.includes(settings.reasoning)) settings.reasoning = 'default';
         container.querySelector('[data-ai-reasoning]').innerHTML = model.levels.map(level => `<button type="button" data-level="${level}" aria-pressed="${level === settings.reasoning}">${REASONING_LABELS[level]}</button>`).join('');
       };
+      settings.model = this.controller.api.models.some(item => item.id === select.value) ? select.value : '';
       paintReasoning();
-      select.addEventListener('change', event => {
-        settings.model = event.target.value;
-        paintReasoning();
-      });
+      select.addEventListener('change', event => { settings.model = event.target.value; paintReasoning(); });
       container.querySelector('[data-ai-reasoning]').addEventListener('click', event => {
         const button = event.target.closest('[data-level]');
-        if (button) {
-          settings.reasoning = button.dataset.level;
-          paintReasoning();
-        }
+        if (button) { settings.reasoning = button.dataset.level; paintReasoning(); }
       });
     }
     openAPISettings() {
       const controller = this.controller;
-      const settings = clone(controller.api.settings || {
-        provider: 'firebase-ai-logic', model: DEFAULT_AI_MODEL.id, reasoning: DEFAULT_AI_MODEL.default,
-        firebaseConfig: {}, debugToken: ''
-      });
-      let context;
-      const readSettings = async () => {
-        const config = context.body.querySelector('[data-ai-config]').value.trim();
-        const token = context.body.querySelector('[data-ai-token]').value.trim();
-        if (!config || !token) {
-          return null;
-        }
-        const source = config.replace(/^(?:const|let|var)\s+firebaseConfig\s*=\s*/, '').replace(/;\s*$/, '').replace(/(^|[{,]\s*)([a-zA-Z][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
-        const input = await JsonWork.run('parse', source);
-        const validator = new SchemaValidator();
-        const firebaseConfig = {};
-        for (const key of ['apiKey', 'projectId', 'appId']) {
-          validator.string(input[key], key, true);
-          firebaseConfig[key] = input[key].trim();
-        }
-        return { provider: 'firebase-ai-logic', model: settings.model, reasoning: settings.reasoning, firebaseConfig, debugToken: token };
-      };
-      context = this.modal('자동구축 API 설정', `<label class="simplerp-field"><span>제공업체</span><select aria-label="제공업체"><option>Firebase AI Logic (Vertex AI)</option></select></label>
-        <div data-model-controls>${this.modelControls(settings)}</div>
-        <div class="simplerp-toolbar"><strong>Firebase AI Logic</strong><button type="button" data-ai-guide>연동 가이드</button></div>
-        <label class="simplerp-field"><span>Firebase config</span><textarea rows="5" data-ai-config spellcheck="false"></textarea></label>
-        <label class="simplerp-field"><span>App Check 디버그 토큰</span><input type="password" data-ai-token autocomplete="off" spellcheck="false"></label>
-        <div class="simplerp-toolbar"><button type="button" data-ai-test>연결 테스트</button><small data-ai-test-status role="status">짧은 AI 요청 · 요금 발생 가능</small></div>`, [
-        ['닫기', () => this.closeModal(context)], ['저장', async () => {
-          const next = await readSettings();
-          controller.api.save(next);
-          controller.auto.initialized = false;
-          controller.auto.warning = '';
-          await this.closeModal(context, true);
-          controller.paint();
-          void controller.ensureAutoCount().catch(error => controller.autoFailure(error));
-        }, true]
+      const api = controller.api;
+      let settings;
+      let busy = false;
+      let testAbort = null;
+      const context = this.modal('자동구축 API 설정', `
+        <div class="simplerp-siwc-heading"><strong>ChatGPT</strong><button type="button" data-ai-guide>연동 가이드</button></div>
+        <div class="simplerp-siwc-account" data-siwc-account hidden><span data-siwc-email></span><button type="button" data-siwc-out>로그아웃</button></div>
+        <button type="button" class="simplerp-btn simplerp-primary" data-siwc-begin data-oai-siwc-button>Continue with ChatGPT</button>
+        <div data-siwc-login hidden>
+          <label class="simplerp-field"><span>승인 후 주소</span><div class="simplerp-siwc-callback"><input type="text" data-siwc-callback autocomplete="off" spellcheck="false" placeholder="복사한 주소를 붙여 넣으세요"><button type="button" data-siwc-complete>연결</button></div>
+            <small class="simplerp-siwc-hint">연결 실패 화면의 주소창에서 전체 주소를 복사하세요.</small></label>
+        </div>
+        <div data-siwc-models hidden><div data-model-controls></div>
+          <div class="simplerp-toolbar"><button type="button" data-ai-test>연결 테스트</button><small class="simplerp-siwc-hint">구독 사용량 차감</small></div>
+        </div>
+        <p class="simplerp-siwc-status" data-siwc-status role="status" hidden></p>`, [
+        ['닫기', () => this.closeModal(context)], ['저장', () => perform('저장 중…', async () => {
+          await api.save(settings);
+          changed();
+          setStatus('저장했습니다.');
+        }), true]
       ]);
-      context.body.querySelector('[data-ai-config]').value = Object.keys(settings.firebaseConfig).length ? JSON.stringify(settings.firebaseConfig, null, 2) : '';
-      context.body.querySelector('[data-ai-token]').value = settings.debugToken;
-      this.bindModelControls(context.body, settings);
-      context.body.querySelector('[data-ai-guide]').addEventListener('click', () => this.openAIGuide());
-      // 연결 테스트는 입력 중인 설정으로만 실행하며 저장된 API 설정을 변경하지 않는다.
-      const testAbort = new AbortController();
-      context.cleanups.push(() => testAbort.abort());
-      let testError = '';
-      const testErrorButton = document.createElement('button');
-      testErrorButton.type = 'button';
-      testErrorButton.className = 'simplerp-icon-btn simplerp-alert';
-      testErrorButton.setAttribute('aria-label', '연결 테스트 오류 상세');
-      testErrorButton.textContent = '!';
-      testErrorButton.addEventListener('click', () => this.run(() => this.openErrorDetails(testErrorButton, testError)));
-      context.body.querySelector('[data-ai-test]').addEventListener('click', () => this.run(async () => {
-        testErrorButton.remove();
-        testError = '';
-        const controls = [...context.body.querySelectorAll('input, textarea, select, button')];
-        const status = context.body.querySelector('[data-ai-test-status]');
-        controls.forEach(control => { control.disabled = true; });
-        status.textContent = '연결 확인 중';
-        try {
-          const next = await readSettings();
-          if (!next) {
-            throw new SimpleRPError('Firebase config와 App Check 디버그 토큰을 입력하세요.');
-          }
-          await new FirebaseAIClient(next).generate('연결 확인입니다. {"ok":true}만 JSON으로 응답하세요.', next, testAbort.signal, { testConnection: true });
-          status.textContent = '연결 성공';
-        } catch (error) {
-          if (!testAbort.signal.aborted) {
-            status.textContent = '연결 실패';
-            testError = errorMessage(error);
-            status.before(testErrorButton);
-            throw error;
-          }
-        } finally {
-          controls.forEach(control => { control.disabled = false; });
+      const status = context.body.querySelector('[data-siwc-status]');
+      const login = context.body.querySelector('[data-siwc-login]');
+      const callback = context.body.querySelector('[data-siwc-callback]');
+      const begin = context.body.querySelector('[data-siwc-begin]');
+      const test = context.body.querySelector('[data-ai-test]');
+      const close = context.footer.firstElementChild;
+      const save = context.footer.lastElementChild;
+      const abort = new AbortController();
+      context.cleanups.push(() => { testAbort?.abort(); abort.abort(); });
+      context.onClose = async () => {
+        if (testAbort) { testAbort.abort(); return true; }
+        if (busy) this.showNotice('연결 작업이 끝난 뒤 닫으세요.');
+        return !busy;
+      };
+      const setStatus = message => {
+        status.textContent = message;
+        status.hidden = !message;
+      };
+      const changed = () => {
+        controller.auto.initialized = false;
+        controller.auto.warning = '';
+        controller.paint();
+        void controller.ensureAutoCount().catch(error => controller.autoFailure(error));
+      };
+      const updateControls = () => {
+        context.dialog.querySelectorAll('input, select, button').forEach(control => {
+          const canCancel = testAbort && (control === test || control === close || control.dataset.action === 'close-modal');
+          control.disabled = busy && !canCancel;
+        });
+        test.textContent = testAbort ? '중지' : '연결 테스트';
+        context.body.querySelector('[data-siwc-complete]').disabled = busy || !callback.value.trim();
+        save.hidden = !api.settings;
+        const select = context.body.querySelector('[data-ai-model]');
+        if (select) select.disabled = busy || !api.models.length;
+      };
+      const paint = () => {
+        const account = api.account;
+        const connected = Boolean(account?.tokens);
+        const permitted = connected && account.scopes.includes('chatgpt.tokens.use.direct');
+        const pending = api.read().pending;
+        context.body.querySelector('[data-siwc-account]').hidden = !connected;
+        context.body.querySelector('[data-siwc-email]').textContent = account?.email || '연결됨';
+        begin.hidden = permitted;
+        login.hidden = !pending || pending.consumed || pending.expiresAt <= Date.now();
+        const models = context.body.querySelector('[data-siwc-models]');
+        models.hidden = !permitted || !api.models.length;
+        settings = { ...api.settings, clientId: account?.clientId, reasoning: api.settings?.reasoning || 'default' };
+        const controls = context.body.querySelector('[data-model-controls]');
+        controls.innerHTML = '';
+        if (!models.hidden) {
+          controls.innerHTML = this.modelControls(settings);
+          this.bindModelControls(controls, settings);
         }
-      }));
+        updateControls();
+      };
+      const perform = async (message, operation) => {
+        if (busy) return;
+        if (controller.auto.job) throw new SimpleRPError('자동구축을 중지한 후 ChatGPT 설정을 변경하세요.');
+        busy = true;
+        setStatus(message);
+        updateControls();
+        try { await operation(); }
+        catch (error) {
+          if (context.dialog.open) setStatus(error.code === 'CANCELLED' ? '중지했습니다.' : errorMessage(error));
+          if (error.code !== 'CANCELLED' && context.dialog.open) throw error;
+        }
+        finally { busy = false; updateControls(); }
+      };
+      const loadModels = async () => {
+        await api.loadModels(abort.signal);
+        paint();
+        changed();
+        setStatus('');
+      };
+      const bind = (selector, message, operation) => context.body.querySelector(selector).addEventListener('click', () => this.run(() => perform(message, operation)));
+      bind('[data-siwc-begin]', '로그인 준비 중…', async () => {
+        // 사용자 클릭 안에서 먼저 열어 팝업 차단을 피한다. 인증정보는 DOM에 넣지 않는다.
+        const popup = window.open('about:blank', '_blank');
+        if (!popup) throw new SimpleRPError('팝업을 허용한 뒤 다시 로그인하세요.');
+        popup.opener = null;
+        try {
+          const url = await api.begin();
+          popup.location.replace(url);
+          callback.value = '';
+          paint();
+          setStatus('');
+        } catch (error) { popup.close(); throw error; }
+      });
+      bind('[data-siwc-complete]', '연결 중…', async () => {
+        const value = callback.value.trim();
+        callback.value = '';
+        await api.complete(value, abort.signal);
+        paint();
+        changed();
+        if (!api.account.scopes.includes('chatgpt.tokens.use.direct')) {
+          setStatus('구독 사용 권한이 필요합니다. 다시 로그인해 승인하세요.');
+          return;
+        }
+        setStatus('모델을 불러오는 중…');
+        await loadModels();
+      });
+      bind('[data-siwc-out]', '로그아웃 중…', async () => {
+        const confirmed = await api.signOut();
+        callback.value = '';
+        paint();
+        changed();
+        setStatus(confirmed ? '' : '기기에서 로그아웃했습니다. ChatGPT 설정에서 앱 연결 해제를 확인하세요.');
+      });
+      test.addEventListener('click', () => {
+        if (testAbort) { testAbort.abort(); setStatus('중지 중…'); return; }
+        void this.run(() => perform('인증 확인 중…', async () => {
+          testAbort = new AbortController();
+          updateControls();
+          try {
+            const result = await api.generate('연결 확인입니다. {"ok":true}만 JSON으로 응답하세요.', settings, testAbort.signal, {
+              testConnection: true, onStatus: message => { if (context.dialog.open) setStatus(message); }
+            });
+            if (JSON.parse(result).ok !== true) throw new SimpleRPError('연결 확인 응답이 올바르지 않습니다.');
+            if (context.dialog.open) setStatus('연결 성공');
+          } finally { testAbort = null; }
+        }));
+      });
+      callback.addEventListener('input', updateControls);
+      context.body.querySelector('[data-ai-guide]').addEventListener('click', () => this.openAIGuide());
+      paint();
+      if (api.account?.tokens) {
+        if (api.account.scopes.includes('chatgpt.tokens.use.direct')) void this.run(() => perform('모델을 불러오는 중…', loadModels));
+        else setStatus('구독 사용 권한이 필요합니다. 다시 로그인해 승인하세요.');
+      }
     }
     openAIGuide() {
-      const context = this.modal('Firebase AI Logic 연동 가이드', `<div class="simplerp-connection-guide">
-        <details open><summary>1. 프로젝트·웹 앱 등록</summary><ol>
-          <li><a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer">Firebase 콘솔</a>에서 사용할 프로젝트를 엽니다.</li>
-          <li>프로젝트 설정 → 일반 → 내 앱에서 웹 앱(&lt;/&gt;)을 등록합니다.</li>
-          <li>웹 앱의 Config를 복사해 API 설정의 Firebase config에 붙여 넣습니다.</li>
-        </ol></details>
-        <details><summary>2. AI Logic 사용 설정</summary><ol>
-          <li>AI 서비스 → AI Logic → 시작하기를 누릅니다.</li>
-          <li>API 제공업체에서 <b>Agent Platform Gemini API(Vertex AI)</b>를 선택하고 사용 설정을 완료합니다.</li>
-          <li>프로젝트의 결제(Blaze) 설정과 사용할 모델의 할당량을 확인합니다.</li>
-        </ol></details>
-        <details><summary>3. App Check 디버그 토큰</summary><ol>
-          <li>보안 → App Check → 앱에서 등록한 웹 앱을 찾습니다.</li>
-          <li>앱 오른쪽 ⋮ → 디버그 토큰 관리를 엽니다.</li>
-          <li>콘솔에서 새 디버그 토큰을 만들고 복사합니다.</li>
-          <li>API 설정의 App Check 디버그 토큰에 붙여 넣고 저장합니다.</li>
-        </ol></details>
-      </div>`, [['닫기', () => this.closeModal(context)]]);
+      const context = this.modal('ChatGPT 연동 가이드', `
+        <section class="simplerp-help-section"><h4>로그인</h4><dl>
+          <dt>1. 로그인</dt><dd>Continue with ChatGPT를 누릅니다.</dd>
+          <dt>2. 승인</dt><dd>열린 화면에서 로그인하고 구독 사용을 승인합니다.</dd>
+          <dt>3. 주소 복사</dt><dd>연결 실패 화면이 나오면 주소창의 전체 주소를 복사합니다.</dd>
+          <dt>4. 연결</dt><dd>설정창의 ‘승인 후 주소’에 붙여 넣고 연결을 누릅니다.</dd>
+        </dl></section>
+        <section class="simplerp-help-section"><h4>모델 설정</h4><dl>
+          <dt>모델·추론</dt><dd>로그인 후 자동으로 표시됩니다. 선택한 뒤 저장하세요.</dd>
+          <dt>연결 테스트</dt><dd>실제 AI 응답을 확인하며 구독 사용량이 차감됩니다.</dd>
+        </dl></section>`, [['닫기', () => this.closeModal(context)]]);
     }
     async stopAutoBuild() {
       const controller = this.controller;
@@ -7423,7 +7775,7 @@ button[aria-pressed=true], .simplerp-active {
         await saving();
         return false;
       }
-      const answer = await this.confirm('자동구축 중지', `현재 단계: ${this.autoStatus().text}\n중지 시: 응답 미적용·미저장, 기존 저장본과 주입 유지\n취소되지 않을 수 있는 작업: 이미 전송한 AI 요청의 서버 처리·과금`, [['cancel', '계속 실행'], ['stop', '중지']]);
+      const answer = await this.confirm('자동구축 중지', `현재 단계: ${this.autoStatus().text}\n중지 시: 응답 미적용·미저장, 기존 저장본과 주입 유지\n취소되지 않을 수 있는 작업: 이미 전송한 AI 요청의 서버 처리·구독 사용량`, [['cancel', '계속 실행'], ['stop', '중지']]);
       if (answer !== 'stop') {
         return false;
       }
@@ -7473,11 +7825,11 @@ button[aria-pressed=true], .simplerp-active {
           <dt>전달 로그</dt><dd>${current > 0 ? `${displayCount(from)}~${displayCount(current)}턴 · ${full ? '전체' : '최근'} ${displayCount(current - from + 1)}턴<small>현재 턴 로그 포함</small>` : '로그 없음'}</dd>
         </dl></section>
         <section class="simplerp-help-section simplerp-run-summary">
-          <h4>API 요청과 요금</h4><dl>
-            <dt>모델</dt><dd>${html(AI_MODELS.find(model => model.id === settings.model)?.name || settings.model)} / 추론 ${html(REASONING_LABELS[settings.reasoning])}</dd>
+          <h4>ChatGPT 구독 사용량</h4><dl>
+            <dt>모델</dt><dd>${html(controller.api.models.find(model => model.id === settings.model)?.name || settings.model)} / 추론 ${html(REASONING_LABELS[settings.reasoning])}</dd>
             <dt>구축</dt><dd>AI 요청 1회</dd>
             <dt>추가 압축</dt><dd>주입 예정량이 40,000자를 넘으면 1회 추가 요청</dd>
-          </dl><p>구축과 추가 압축은 각각 API 요금이 발생합니다.</p>
+          </dl><p>구축과 추가 압축은 각각 ChatGPT 구독 사용량을 사용합니다.</p>
         </section>`;
       const run = document.createElement('button');
       run.className = 'simplerp-btn simplerp-primary';
@@ -7507,7 +7859,7 @@ button[aria-pressed=true], .simplerp-active {
         const pages = Math.max(1, Math.ceil(list.length / 8));
         page = Math.min(page, pages - 1);
         context.body.innerHTML = `<div class="simplerp-history-bar"><div class="simplerp-history-tabs" role="tablist">${[['current', '현재방'], ['all', '전체방']].map(([key, label]) => `<button type="button" role="tab" data-history-scope="${key}" aria-selected="${scope === key}" aria-pressed="${scope === key}">${label}</button>`).join('')}</div><span class="simplerp-history-retention">이력은 이 기기에만 저장됩니다.<br>최대 보관: 방별 5건 / 전체 50건</span><button type="button" data-history-clear ${list.length ? '' : 'disabled'}>일괄삭제</button></div>
-          <div class="simplerp-list">${list.slice(page * 8, page * 8 + 8).map(row => `<div class="simplerp-history-row" data-failed="${['failed', 'cancelled'].includes(row.outcome)}"><span>${icon('flame')}</span><div><strong>${html(AI_MODELS.find(item => item.id === row.model)?.name || row.model)} · ${html(REASONING_LABELS[row.reasoning] || '')} · ${GUIDE_LABELS[row.mode]}</strong><small>${scope === 'all' ? `${html(row.roomName)} · ` : ''}${new Date(row.createdAt).toLocaleString('ko-KR')}${row.outcome === 'failed' ? ' · 실패' : row.outcome === 'cancelled' ? ' · 중지' : row.outcome === 'compressed' ? ' · 압축으로 계속' : ''}</small></div>${row.error ? `<button type="button" class="simplerp-icon-btn simplerp-alert" data-history-error="${row.id}" aria-label="실패 내용">!</button>` : ''}<button type="button" class="simplerp-icon-btn" data-history-download="${row.id}" aria-label="응답 다운로드">${icon('download')}</button><button type="button" class="simplerp-icon-btn" data-history-diff="${row.id}" aria-label="적용 전후 비교">${icon('diff')}</button><button type="button" class="simplerp-icon-btn" data-history-delete="${row.id}" aria-label="이력 삭제">${icon('trash')}</button></div>`).join('') || '<p class="simplerp-empty">이력 없음</p>'}</div>
+          <div class="simplerp-list">${list.slice(page * 8, page * 8 + 8).map(row => `<div class="simplerp-history-row" data-failed="${['failed', 'cancelled'].includes(row.outcome)}"><span>${icon('flame')}</span><div><strong>${html(controller.api.models.find(item => item.id === row.model)?.name || row.model)} · ${html(REASONING_LABELS[row.reasoning] || '')} · ${GUIDE_LABELS[row.mode]}</strong><small>${scope === 'all' ? `${html(row.roomName)} · ` : ''}${new Date(row.createdAt).toLocaleString('ko-KR')}${row.outcome === 'failed' ? ' · 실패' : row.outcome === 'cancelled' ? ' · 중지' : row.outcome === 'compressed' ? ' · 압축으로 계속' : ''}</small></div>${row.error ? `<button type="button" class="simplerp-icon-btn simplerp-alert" data-history-error="${row.id}" aria-label="실패 내용">!</button>` : ''}<button type="button" class="simplerp-icon-btn" data-history-download="${row.id}" aria-label="응답 다운로드">${icon('download')}</button><button type="button" class="simplerp-icon-btn" data-history-diff="${row.id}" aria-label="적용 전후 비교">${icon('diff')}</button><button type="button" class="simplerp-icon-btn" data-history-delete="${row.id}" aria-label="이력 삭제">${icon('trash')}</button></div>`).join('') || '<p class="simplerp-empty">이력 없음</p>'}</div>
           <div class="simplerp-history-page"><button type="button" data-page="-1" ${page ? '' : 'disabled'}>이전</button><small>${page + 1} / ${pages}</small><button type="button" data-page="1" ${page + 1 < pages ? '' : 'disabled'}>다음</button></div>`;
       };
       context.body.addEventListener('click', event => this.run(async () => {
@@ -8817,10 +9169,10 @@ button[aria-pressed=true], .simplerp-active {
       const sections = {
         'auto-build': [
           ['동작', [['조건', 'API 설정·이 방 자동구축·주입 사용 켜짐'], ['로그', '예약 턴까지 반영, 가장 최신 턴 제외'], ['방식', '기억이 없으면 전체구축, 이후 이어서구축'], ['완료', '검사 후 자동저장·주입 갱신']]],
-          ['추가압축', [['조건', '선별한 주입 예정량이 40,000자 초과'], ['횟수·요금', '최대 1회 추가 요청, 별도 비용 가능'], ['실패', '기존 저장본·주입 유지, 이력 확인']]],
+          ['추가압축', [['조건', '선별한 주입 예정량이 40,000자 초과'], ['횟수·사용량', '최대 1회 추가 요청, 구독 사용량 추가 차감'], ['실패', '기존 저장본·주입 유지, 이력 확인']]],
           ['설정', [['저장위치', 'API 설정과 방별 자동 토글은 이 기기에만 저장']]],
-          ['편집·중지', [['편집', '요청 중 현재방 편집 제한, 중지 후 가능'], ['AI요청중', '중지 시 응답 미적용·미저장'], ['저장중', '전송된 저장은 중지 불가'], ['요금', '중지해도 전송된 AI 요청은 과금 가능']]],
-          ['다중접속', [['중복요청', '같은 방 여러 기기·탭에서 자동구축하면 중복 요금 가능']]]
+          ['편집·중지', [['편집', '요청 중 현재방 편집 제한, 중지 후 가능'], ['AI요청중', '중지 시 응답 미적용·미저장'], ['저장중', '전송된 저장은 중지 불가'], ['사용량', '중지해도 전송된 AI 요청은 구독 사용량 차감 가능']]],
+          ['다중접속', [['중복요청', '같은 방 여러 기기·탭에서 자동구축하면 구독 사용량 중복 차감 가능']]]
         ],
         'manual-build': [
           ['기능', [['전체구축', '전체 로그로 기억 구성'], ['이어서구축', '기존 기억에 선택한 최신 로그 반영'], ['압축', '중복 통합·표현 정리'], ['JSON가져오기', '검사·변경사항 확인 후 적용']]],
