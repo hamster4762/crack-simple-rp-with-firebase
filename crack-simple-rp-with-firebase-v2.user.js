@@ -3042,17 +3042,20 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
     return new SimpleRPError(siwcSafeText(`OpenAI 요청 실패 (HTTP ${status}, ${code})\n${message.slice(0, 3000)}${requestId ? `\nRequest ID: ${requestId}` : ''}`), { code, status });
   }
   // DB용 통신은 유지하고, SIWC만 쿠키 없는 요청과 SSE 읽기를 사용한다.
-  function siwcHttp(path, { method = 'GET', body, token, signal, onText, timeout = 30000 } = {}) {
-    const service = path.endsWith('/models') ? '모델 조회' : path.endsWith('/responses') ? 'AI 응답'
+  function siwcHttp(path, { method = 'GET', body, token, signal, onText, onWait, timeout = 30000 } = {}) {
+    const service = path.endsWith('/models') ? '모델 조회' : path.endsWith('/responses') ? '응답 요청'
       : path.endsWith('/jwks.json') ? '서명 키 조회' : path.endsWith('/revoke') ? '로그아웃' : 'OAuth 토큰';
     return new Promise((resolve, reject) => {
       let handle;
       let settled = false;
       let received = 0;
+      let waitTimer;
+      const startedAt = Date.now();
       const finish = (error, value) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(waitTimer);
         signal?.removeEventListener('abort', abort);
         error ? reject(error) : resolve(value);
       };
@@ -3061,7 +3064,15 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         handle?.abort();
       };
       const abort = () => stop(new SimpleRPError('요청을 중지했습니다.', { code: 'CANCELLED' }));
-      const timer = setTimeout(() => stop(new SimpleRPError(`OpenAI ${service} 요청 시간 초과 (${timeout / 1000}초). 자동 재전송하지 않았습니다.`, { code: 'NETWORK' })), timeout);
+      const timer = timeout > 0 ? setTimeout(() => stop(new SimpleRPError(`OpenAI ${service}: 대기 시간 초과\n발생 위치: 스크립트 타이머\n제한: ${timeout / 1000}초`, { code: 'LOCAL_TIMEOUT' })), timeout) : null;
+      if (onWait) {
+        const notify = () => {
+          if (settled) return;
+          onWait();
+          waitTimer = setTimeout(notify, 180000);
+        };
+        waitTimer = setTimeout(notify, 300000);
+      }
       if (signal?.aborted) { abort(); return; }
       signal?.addEventListener('abort', abort, { once: true });
       const url = new URL(path);
@@ -3084,6 +3095,28 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       };
       const responseText = response => typeof response.responseText === 'string' && response.responseText
         ? response.responseText : typeof response.response === 'string' ? response.response : '';
+      const transportFailure = (event, response = {}) => {
+        if (settled) return;
+        const status = Number(response?.status) || 0;
+        const text = responseText(response || {});
+        try { readText(response || {}); }
+        catch (error) {
+          finish(error instanceof SimpleRPError ? error : new SimpleRPError(`OpenAI ${service} 응답 처리 실패.\n오류 종류: ${error.name || 'Error'}`));
+          return;
+        }
+        // HTTP 오류 응답을 받았다면 통신 이벤트 이름으로 서버 오류를 덮어쓰지 않는다.
+        if (status >= 400) {
+          const error = siwcError(status, text, response.responseHeaders);
+          error.message = `OpenAI ${service}: HTTP 오류 응답\n발생 위치: Tampermonkey ${event}\n${error.message}`;
+          finish(error);
+          return;
+        }
+        const requestId = /^(?:x-request-id|openai-request-id):\s*([^\r\n]+)/im.exec(response?.responseHeaders || '')?.[1]?.trim();
+        const label = event === 'ontimeout' ? '대기 시간 초과' : event === 'onabort' ? '요청 중단' : '통신 오류';
+        finish(new SimpleRPError(siwcSafeText(`OpenAI ${service}: ${label}\n발생 위치: Tampermonkey ${event}\n스크립트 대기 제한: ${timeout > 0 ? `${timeout / 1000}초` : '없음'}\n경과 ${Math.floor((Date.now() - startedAt) / 1000)}초 · HTTP ${status || '미제공'} · 수신 ${Math.max(received, text.length)}자${requestId ? `\nRequest ID: ${requestId}` : ''}`), {
+          code: event === 'ontimeout' ? 'TRANSPORT_TIMEOUT' : 'NETWORK', status, transportEvent: event
+        }));
+      };
       const readText = response => {
         if (settled || !onText || response.status < 200 || response.status >= 300) return;
         const text = responseText(response);
@@ -3095,7 +3128,8 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       };
       try {
         handle = GM_xmlhttpRequest({
-          method, url: url.href, data: body, anonymous: true, redirect: 'error', timeout,
+          method, url: url.href, data: body, anonymous: true, redirect: 'error',
+          ...(timeout > 0 ? { timeout } : {}),
           headers: {
             Accept: onText ? 'text/event-stream' : 'application/json',
             ...(body ? { 'Content-Type': token ? 'application/json' : 'application/x-www-form-urlencoded' } : {}),
@@ -3114,9 +3148,9 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
               complete(response, responseText(response));
             } catch (error) { stop(error instanceof SimpleRPError ? error : new SimpleRPError(`OpenAI ${service} 응답 처리 실패.\n오류 종류: ${error.name || 'Error'}`)); }
           },
-          ontimeout() { stop(new SimpleRPError(`OpenAI ${service} 요청 시간 초과 (${timeout / 1000}초). 자동 재전송하지 않았습니다.`, { code: 'NETWORK' })); },
-          onerror() { finish(new SimpleRPError(`OpenAI ${service} 네트워크 연결 실패. 권한과 네트워크를 확인하세요.`, { code: 'NETWORK' })); },
-          onabort() { finish(new SimpleRPError(`OpenAI ${service} 요청이 중단됐습니다.`, { code: 'CANCELLED' })); }
+          ontimeout(response) { transportFailure('ontimeout', response); },
+          onerror(response) { transportFailure('onerror', response); },
+          onabort(response) { transportFailure('onabort', response); }
         });
       } catch {
         finish(new SimpleRPError(`OpenAI ${service} 요청을 시작하지 못했습니다. Tampermonkey 네트워크 권한을 확인하세요.`));
@@ -3237,8 +3271,9 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       }
     }
     async credentials(data, clientId, { nonce, subject, previous, signal } = {}) {
+      const receivedAt = Date.now();
       const invalid = ['access_token', 'refresh_token'].filter(key => typeof data[key] !== 'string' || !data[key]);
-      if (data.token_type?.toLowerCase() !== 'bearer') invalid.push('token_type');
+      if (typeof data.token_type !== 'string' || data.token_type.toLowerCase() !== 'bearer') invalid.push('token_type');
       if (!Number.isFinite(data.expires_in) || data.expires_in <= 0) invalid.push('expires_in');
       if (typeof data.scope !== 'string') invalid.push('scope');
       if (!previous && !data.id_token) invalid.push('id_token');
@@ -3247,7 +3282,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       if ((!previous && !identity) || (identity && subject && identity.sub !== subject)) throw new SimpleRPError('로그인한 ChatGPT 계정이 선택한 계정과 다릅니다.');
       return {
         subject: identity?.sub || subject, email: identity?.email || previous?.email || '', issuer: SIWC_ISSUER,
-        scopes: data.scope.split(/\s+/).filter(Boolean), expiresAt: Date.now() + data.expires_in * 1000,
+        scopes: data.scope.split(/\s+/).filter(Boolean), expiresAt: receivedAt + data.expires_in * 1000,
         tokens: { access_token: data.access_token, refresh_token: data.refresh_token, id_token: data.id_token || previous?.tokens.id_token }
       };
     }
@@ -3296,7 +3331,8 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       return this.lock(async () => {
         const state = this.read();
         const account = state.accounts.find(item => item.clientId === clientId);
-        if (!account?.tokens || !account.scopes.includes('chatgpt.tokens.use.direct')) throw new SimpleRPError('ChatGPT에 로그인하고 구독 사용 권한을 승인하세요.');
+        if (!account?.tokens) throw new SimpleRPError('저장된 ChatGPT 인증정보가 없습니다. 다시 로그인하세요.');
+        if (!account.scopes.includes('chatgpt.tokens.use.direct')) throw new SimpleRPError('ChatGPT 구독 사용 권한(chatgpt.tokens.use.direct)이 없습니다. 다시 로그인해 승인하세요.');
         if (signal?.aborted) throw new SimpleRPError('요청을 중지했습니다.', { code: 'CANCELLED' });
         if (account.expiresAt > Date.now() + 30000) return account.tokens.access_token;
         try {
@@ -3309,10 +3345,12 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           return account.tokens.access_token;
         } catch (error) {
           if (['invalid_grant', 'invalid_refresh_token', 'token_expired', 'refresh_token_expired', 'refresh_token_invalidated', 'refresh_token_reused'].includes(error.code)) {
+            const detail = siwcSafeText(errorMessage(error));
             delete account.tokens;
             this.write(state);
+            throw new SimpleRPError(`ChatGPT 인증 갱신 실패: 갱신 토큰을 더 이상 사용할 수 없습니다. 다시 로그인하세요.\n${detail}`, { code: error.code, status: error.status });
           }
-          throw error;
+          throw new SimpleRPError(`ChatGPT 토큰 갱신 실패\n${siwcSafeText(errorMessage(error))}`, { code: error.code, status: error.status });
         }
       }, signal);
     }
@@ -3356,7 +3394,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         return { confirmed, error: failure };
       });
     }
-    async generate(text, settings, signal, { testConnection = false, onStatus = () => {} } = {}) {
+    async generate(text, settings, signal, { testConnection = false, onStatus = () => {}, onWait = onStatus } = {}) {
       const state = this.read();
       const model = state.accounts.find(account => account.clientId === settings.clientId)?.models?.find(item => item.id === settings.model);
       if (!model?.levels.includes(settings.reasoning)) throw new SimpleRPError('API 설정에서 계정의 모델과 추론을 선택하세요.');
@@ -3392,8 +3430,10 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         }
       };
       onStatus('응답 대기 중…');
+      const startedAt = Date.now();
       const response = await siwcHttp(`${SIWC_RESOURCE}/responses`, {
-        method: 'POST', token, signal, timeout: testConnection ? 60000 : 180000,
+        method: 'POST', token, signal, timeout: 0,
+        onWait: () => onWait(`AI 응답을 ${Math.floor((Date.now() - startedAt) / 60000)}분째 기다리고 있습니다. 계속 기다리거나 직접 중지할 수 있습니다.`),
         body: JSON.stringify({ model: settings.model, input: [{ role: 'user', content: text }], store: false, stream: true,
           ...(settings.reasoning !== 'default' ? { reasoning: { effort: settings.reasoning } } : {}) }),
         onText(chunk) {
@@ -3406,6 +3446,22 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
             buffer = buffer.slice(match.index + match[0].length);
           }
         }
+      }).catch(async error => {
+        if (['token_expired', 'access_token_expired'].includes(error.code)) {
+          // 서버가 만료를 명시한 토큰만 무효화한다. 추론 요청은 다시 보내지 않는다.
+          await this.lock(() => {
+            const latest = this.read();
+            const account = latest.accounts.find(item => item.clientId === settings.clientId);
+            if (account?.tokens?.access_token === token) {
+              account.expiresAt = 0;
+              this.write(latest);
+            }
+          }, signal).catch(updateError => {
+            error.message += `\n만료 상태 저장 실패: ${siwcSafeText(errorMessage(updateError))}`;
+          });
+          error.message = `OpenAI 접근 토큰이 만료되었습니다. 다시 실행하면 인증을 갱신합니다.\n${error.message}`;
+        }
+        throw error;
       });
       if (buffer.trim()) event(buffer);
       if (!output.trim()) {
@@ -4022,12 +4078,10 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         Promise.resolve().then(async () => {
           originalAccount = crackAccountScope();
           const preparation = await adapter.beforeSend(frame, String(text));
-          if (preparation?.frontier) {
-            replay();
+          replay();
+          if (preparation) {
             adapter.generation.frontier = preparation.frontier;
             adapter.generation.frontierText = preparation.frontierText;
-          } else {
-            replay();
           }
         }).catch(error => {
           const retryWithoutInjection = async () => {
@@ -4224,7 +4278,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       }
       job.abort.abort();
       this.auto.job = null;
-      this.auto.due = true;
+      if (job.roomKey === this.identity?.roomKey) this.auto.due = true;
       this.paint();
     }
     async compressionText(room, settings = this.settings, source = null) {
@@ -4316,7 +4370,9 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         job.phase = 'building';
         this.paint();
         const obtain = async text => {
-          lastRaw = await this.api.generate(text, apiSettings, job.abort.signal);
+          lastRaw = await this.api.generate(text, apiSettings, job.abort.signal, {
+            onWait: message => this.ui?.showNotice(message)
+          });
           assertActive();
           const packet = await JsonWork.run('parse', lastRaw);
           await new SchemaValidator().packet(packet);
@@ -4375,13 +4431,20 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           this.autoFailure(error);
         }
       } finally {
+        let historySaved = true;
         for (const entry of entries) {
           const { before: previous, after, ...status } = entry;
           await this.autoStore.add({
             id: newId('build'), roomKey: identity.roomKey, roomName: before.meta.name,
             createdAt: Date.now(), provider: 'openai-siwc', model: apiSettings.model,
             reasoning: apiSettings.reasoning, ...status
-          }, { before: previous, ...(after !== undefined ? { after } : {}) }).catch(error => this.ui?.showNotice(errorMessage(error)));
+          }, { before: previous, ...(after !== undefined ? { after } : {}) }).catch(error => {
+            historySaved = false;
+            this.ui?.showNotice(errorMessage(error));
+          });
+        }
+        if (historySaved && epoch !== this.routeEpoch && lastRaw && !job.abort.signal.aborted) {
+          this.ui?.showNotice('이전 채팅방의 AI 응답을 이력에 보관했습니다.');
         }
         if (this.auto.job === job) {
           this.auto.job = null;
@@ -4497,14 +4560,8 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       if (!route) {
         return;
       }
-      if (this.auto.job) {
-        if (this.auto.job.phase !== 'saving') {
-          this.cancelAutoBuild();
-        } else {
-          this.auto.job = null;
-        }
-      }
-      this.auto = { enabled: false, job: null, warning: '', initialized: false, due: false, observedTotal: null, attemptedTarget: null };
+      // 방을 옮겨도 유료 요청은 취소하지 않는다. 완료 후 출처 검증·기존 이력 경로로 처리한다.
+      this.auto = { enabled: false, job: this.auto.job, warning: '', initialized: false, due: false, observedTotal: null, attemptedTarget: null };
       this.repository.onNotice = error => this.ui?.showError(error);
       this.routeEpoch += 1;
       clearTimeout(this.refreshTimer);
@@ -4756,7 +4813,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         if (this.adapter.generation?.chatId === identity.chatId) {
           const latest = head.find(message => message.role === 'assistant' && message.complete && message.adopted);
           const generation = this.adapter.generation;
-          const progressed = latest && generation.frontier && (latest.id !== generation.frontier || latest.text !== generation.frontierText);
+          const progressed = latest && generation.frontier !== null && (latest.id !== generation.frontier || latest.text !== generation.frontierText);
           if (progressed && head.find(message => ['user', 'assistant'].includes(message.role))?.role === 'assistant') {
             const observed = JSON.stringify([latest.id, latest.text]);
             if (generation.observed !== observed) {
@@ -4799,7 +4856,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           this.injection.carrierId = own[0].id;
         }
         const stable = selectCarrier(head);
-        const needsReconcile = this.injection.intent && !this.adapter.generation &&
+        const needsReconcile = this.injection.intent && Boolean(this.currentRoomCache) && !this.adapter.generation &&
           (recover || changed || Boolean(this.injection.error));
         if (!needsReconcile && this.injection.intent && this.currentRoomCache && !this.adapter.generation && !this.injection.error) {
           this.injection.phase = 'ON';
@@ -7761,6 +7818,7 @@ button[aria-pressed=true], .simplerp-active {
         try { await operation(); }
         catch (error) {
           if (context.dialog.open) {
+            if (!api.account?.tokens) paint();
             if (error.code === 'CANCELLED') this.showNotice('중지했습니다.');
             else report(error, current);
           }
