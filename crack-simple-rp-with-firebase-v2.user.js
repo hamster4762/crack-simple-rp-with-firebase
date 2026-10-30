@@ -3042,17 +3042,19 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
     return new SimpleRPError(siwcSafeText(`OpenAI 요청 실패 (HTTP ${status}, ${code})\n${message.slice(0, 3000)}${requestId ? `\nRequest ID: ${requestId}` : ''}`), { code, status });
   }
   // DB용 통신은 유지하고, SIWC만 쿠키 없는 요청과 SSE 읽기를 사용한다.
-  function siwcHttp(path, { method = 'GET', body, token, signal, onText, timeout = 30000 } = {}) {
+  function siwcHttp(path, { method = 'GET', body, token, signal, onText, onWait, timeout = 30000 } = {}) {
     const service = path.endsWith('/models') ? '모델 조회' : path.endsWith('/responses') ? 'AI 응답'
       : path.endsWith('/jwks.json') ? '서명 키 조회' : path.endsWith('/revoke') ? '로그아웃' : 'OAuth 토큰';
     return new Promise((resolve, reject) => {
       let handle;
       let settled = false;
       let received = 0;
+      let waitTimer;
       const finish = (error, value) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(waitTimer);
         signal?.removeEventListener('abort', abort);
         error ? reject(error) : resolve(value);
       };
@@ -3061,7 +3063,15 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         handle?.abort();
       };
       const abort = () => stop(new SimpleRPError('요청을 중지했습니다.', { code: 'CANCELLED' }));
-      const timer = setTimeout(() => stop(new SimpleRPError(`OpenAI ${service} 요청 시간 초과 (${timeout / 1000}초). 자동 재전송하지 않았습니다.`, { code: 'NETWORK' })), timeout);
+      const timer = timeout > 0 ? setTimeout(() => stop(new SimpleRPError(`OpenAI ${service} 요청 시간 초과 (${timeout / 1000}초). 자동 재전송하지 않았습니다.`, { code: 'NETWORK' })), timeout) : null;
+      if (onWait) {
+        const notify = () => {
+          if (settled) return;
+          onWait();
+          waitTimer = setTimeout(notify, 180000);
+        };
+        waitTimer = setTimeout(notify, 300000);
+      }
       if (signal?.aborted) { abort(); return; }
       signal?.addEventListener('abort', abort, { once: true });
       const url = new URL(path);
@@ -3114,7 +3124,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
               complete(response, responseText(response));
             } catch (error) { stop(error instanceof SimpleRPError ? error : new SimpleRPError(`OpenAI ${service} 응답 처리 실패.\n오류 종류: ${error.name || 'Error'}`)); }
           },
-          ontimeout() { stop(new SimpleRPError(`OpenAI ${service} 요청 시간 초과 (${timeout / 1000}초). 자동 재전송하지 않았습니다.`, { code: 'NETWORK' })); },
+          ontimeout() { finish(new SimpleRPError(`OpenAI ${service} 통신이 시간 초과로 종료됐습니다. 자동 재전송하지 않았습니다.`, { code: 'NETWORK' })); },
           onerror() { finish(new SimpleRPError(`OpenAI ${service} 네트워크 연결 실패. 권한과 네트워크를 확인하세요.`, { code: 'NETWORK' })); },
           onabort() { finish(new SimpleRPError(`OpenAI ${service} 요청이 중단됐습니다.`, { code: 'CANCELLED' })); }
         });
@@ -3356,7 +3366,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         return { confirmed, error: failure };
       });
     }
-    async generate(text, settings, signal, { testConnection = false, onStatus = () => {} } = {}) {
+    async generate(text, settings, signal, { testConnection = false, onStatus = () => {}, onWait = onStatus } = {}) {
       const state = this.read();
       const model = state.accounts.find(account => account.clientId === settings.clientId)?.models?.find(item => item.id === settings.model);
       if (!model?.levels.includes(settings.reasoning)) throw new SimpleRPError('API 설정에서 계정의 모델과 추론을 선택하세요.');
@@ -3392,8 +3402,10 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         }
       };
       onStatus('응답 대기 중…');
+      const startedAt = Date.now();
       const response = await siwcHttp(`${SIWC_RESOURCE}/responses`, {
-        method: 'POST', token, signal, timeout: testConnection ? 60000 : 180000,
+        method: 'POST', token, signal, timeout: 0,
+        onWait: () => onWait(`AI 응답을 ${Math.floor((Date.now() - startedAt) / 60000)}분째 기다리고 있습니다. 계속 기다리거나 직접 중지할 수 있습니다.`),
         body: JSON.stringify({ model: settings.model, input: [{ role: 'user', content: text }], store: false, stream: true,
           ...(settings.reasoning !== 'default' ? { reasoning: { effort: settings.reasoning } } : {}) }),
         onText(chunk) {
@@ -4022,12 +4034,10 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         Promise.resolve().then(async () => {
           originalAccount = crackAccountScope();
           const preparation = await adapter.beforeSend(frame, String(text));
-          if (preparation?.frontier) {
-            replay();
+          replay();
+          if (preparation) {
             adapter.generation.frontier = preparation.frontier;
             adapter.generation.frontierText = preparation.frontierText;
-          } else {
-            replay();
           }
         }).catch(error => {
           const retryWithoutInjection = async () => {
@@ -4224,7 +4234,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       }
       job.abort.abort();
       this.auto.job = null;
-      this.auto.due = true;
+      if (job.roomKey === this.identity?.roomKey) this.auto.due = true;
       this.paint();
     }
     async compressionText(room, settings = this.settings, source = null) {
@@ -4316,7 +4326,9 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         job.phase = 'building';
         this.paint();
         const obtain = async text => {
-          lastRaw = await this.api.generate(text, apiSettings, job.abort.signal);
+          lastRaw = await this.api.generate(text, apiSettings, job.abort.signal, {
+            onWait: message => this.ui?.showNotice(message)
+          });
           assertActive();
           const packet = await JsonWork.run('parse', lastRaw);
           await new SchemaValidator().packet(packet);
@@ -4375,13 +4387,20 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           this.autoFailure(error);
         }
       } finally {
+        let historySaved = true;
         for (const entry of entries) {
           const { before: previous, after, ...status } = entry;
           await this.autoStore.add({
             id: newId('build'), roomKey: identity.roomKey, roomName: before.meta.name,
             createdAt: Date.now(), provider: 'openai-siwc', model: apiSettings.model,
             reasoning: apiSettings.reasoning, ...status
-          }, { before: previous, ...(after !== undefined ? { after } : {}) }).catch(error => this.ui?.showNotice(errorMessage(error)));
+          }, { before: previous, ...(after !== undefined ? { after } : {}) }).catch(error => {
+            historySaved = false;
+            this.ui?.showNotice(errorMessage(error));
+          });
+        }
+        if (historySaved && epoch !== this.routeEpoch && lastRaw && !job.abort.signal.aborted) {
+          this.ui?.showNotice('이전 채팅방의 AI 응답을 이력에 보관했습니다.');
         }
         if (this.auto.job === job) {
           this.auto.job = null;
@@ -4497,14 +4516,8 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       if (!route) {
         return;
       }
-      if (this.auto.job) {
-        if (this.auto.job.phase !== 'saving') {
-          this.cancelAutoBuild();
-        } else {
-          this.auto.job = null;
-        }
-      }
-      this.auto = { enabled: false, job: null, warning: '', initialized: false, due: false, observedTotal: null, attemptedTarget: null };
+      // 방을 옮겨도 유료 요청은 취소하지 않는다. 완료 후 출처 검증·기존 이력 경로로 처리한다.
+      this.auto = { enabled: false, job: this.auto.job, warning: '', initialized: false, due: false, observedTotal: null, attemptedTarget: null };
       this.repository.onNotice = error => this.ui?.showError(error);
       this.routeEpoch += 1;
       clearTimeout(this.refreshTimer);
@@ -4756,7 +4769,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         if (this.adapter.generation?.chatId === identity.chatId) {
           const latest = head.find(message => message.role === 'assistant' && message.complete && message.adopted);
           const generation = this.adapter.generation;
-          const progressed = latest && generation.frontier && (latest.id !== generation.frontier || latest.text !== generation.frontierText);
+          const progressed = latest && generation.frontier !== null && (latest.id !== generation.frontier || latest.text !== generation.frontierText);
           if (progressed && head.find(message => ['user', 'assistant'].includes(message.role))?.role === 'assistant') {
             const observed = JSON.stringify([latest.id, latest.text]);
             if (generation.observed !== observed) {
@@ -4799,7 +4812,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           this.injection.carrierId = own[0].id;
         }
         const stable = selectCarrier(head);
-        const needsReconcile = this.injection.intent && !this.adapter.generation &&
+        const needsReconcile = this.injection.intent && Boolean(this.currentRoomCache) && !this.adapter.generation &&
           (recover || changed || Boolean(this.injection.error));
         if (!needsReconcile && this.injection.intent && this.currentRoomCache && !this.adapter.generation && !this.injection.error) {
           this.injection.phase = 'ON';
