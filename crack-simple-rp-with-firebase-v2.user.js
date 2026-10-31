@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      2.0.0.0
+// @version      2.0.0.1
 // @description  Crack 채팅의 기억을 정리하고 주입해 이야기의 연속성을 유지합니다. 로컬·Firebase 저장과 AI 기억 구축을 지원합니다. (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -3403,6 +3403,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       let buffer = '';
       let receiving = false;
       let completed = false;
+      let responseEventSeen = false;
       let output = '';
       const textParts = new Map();
       const eventTypes = [];
@@ -3413,7 +3414,9 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         if (!value || value === '[DONE]') return;
         const data = siwcJSON(value, 'SSE 이벤트');
         const type = data.type || lines.find(line => line.startsWith('event:'))?.slice(6).trim();
-        eventTypes.push(/^(?:response\.[a-z_.]+|error)$/.test(type) ? type : '알 수 없음');
+        if (typeof type === 'string' && type.startsWith('response.')) responseEventSeen = true;
+        eventTypes.push(typeof type === 'string' && /^[a-z][a-z0-9_.:-]{0,79}$/i.test(type)
+          ? siwcSafeText(type) : type == null ? '이벤트 이름 없음' : '이벤트 이름 형식 미지원');
         if (eventTypes.length > 5) eventTypes.shift();
         if (type === 'response.failed' || type === 'error') throw siwcError(200, JSON.stringify({ error: data.response?.error || data.error || data }));
         if (type === 'response.incomplete') throw failure(`OpenAI 응답이 미완료 상태로 종료됐습니다.\n사유: ${data.response?.incomplete_details?.reason || '서버가 사유를 제공하지 않음'}`);
@@ -3473,8 +3476,9 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       }
       if (!completed || !output.trim()) {
         const reason = !response.characters ? '응답 본문이 비어 있습니다.'
-          : !completed ? '응답 완료 이벤트를 받지 못했습니다.' : '응답은 완료됐지만 텍스트가 없습니다.';
-        throw failure(`${reason}\nHTTP ${response.status} · ${response.contentType} · 수신 ${response.characters}자\n이벤트: ${eventTypes.join(' → ') || '없음'}\nRequest ID: ${response.requestId}`);
+          : !completed && !responseEventSeen ? '수신이 종료됐지만 받은 데이터에서 OpenAI 응답 이벤트를 식별하지 못했습니다.'
+          : !completed ? '응답 데이터 수신이 끝났지만 완료 신호(response.completed)를 확인하지 못했습니다.' : '응답은 완료됐지만 텍스트가 없습니다.';
+        throw failure(`${reason}\nHTTP ${response.status} · 응답 형식: ${response.contentType} · 수신 ${response.characters}자\n텍스트 추출: ${output.length}자\n마지막 이벤트: ${eventTypes.join(' → ') || '없음'}\nRequest ID: ${response.requestId}`);
       }
       return output.trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
     }
