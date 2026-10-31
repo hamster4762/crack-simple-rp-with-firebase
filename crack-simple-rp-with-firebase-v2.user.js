@@ -4316,6 +4316,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
       this.auto.job = job;
       this.auto.warning = '';
       const entries = [];
+      let stageStartedAt = performance.now();
       let mode = Object.values(before.memory.people).some(items => items.length) || before.memory.currentState.body.trim() || before.memory.dateLogs.length || before.memory.lore.length ? 'continue' : 'full';
       let lastRaw = '';
       let historyBefore = portableRoom(before);
@@ -4391,7 +4392,8 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           return selectInjection(candidate, this.recentTurns, '', carrier ? stripOwnBlock(carrier.text).text : '');
         };
         if (capacity().over) {
-          entries.push({ mode, outcome: 'compressed', before: historyBefore, after: packet });
+          entries.push({ mode, outcome: 'compressed', durationMs: Math.round(performance.now() - stageStartedAt), before: historyBefore, after: packet });
+          stageStartedAt = performance.now();
           historyBefore = portableRoom(candidate);
           mode = 'compress';
           lastAfter = undefined;
@@ -4409,7 +4411,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         job.phase = 'saving';
         this.paint();
         const saved = await repository.saveRoom(candidate, before.meta.updatedAt, false, savedEtag);
-        entries.push({ mode, outcome: 'saved', before: historyBefore, after: portableRoom(saved) });
+        entries.push({ mode, outcome: 'saved', durationMs: Math.round(performance.now() - stageStartedAt), before: historyBefore, after: portableRoom(saved) });
         if (epoch === this.routeEpoch && repository === this.repository) {
           this.currentRoomCache = clone(saved);
           if (this.showingCurrentRoom) {
@@ -4426,7 +4428,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
           }
         }
       } catch (error) {
-        entries.push({ mode, outcome: error.code === 'CANCELLED' ? 'cancelled' : 'failed', error: errorMessage(error), before: historyBefore, after: lastAfter || lastRaw || undefined });
+        entries.push({ mode, outcome: error.code === 'CANCELLED' ? 'cancelled' : 'failed', durationMs: Math.round(performance.now() - stageStartedAt), error: errorMessage(error), before: historyBefore, after: lastAfter || lastRaw || undefined });
         if (epoch === this.routeEpoch && error.code !== 'CANCELLED') {
           this.autoFailure(error);
         }
@@ -8005,12 +8007,17 @@ button[aria-pressed=true], .simplerp-active {
       let page = 0;
       const context = this.modal('자동구축 이력', '', []);
       const filtered = () => rows.filter(row => scope === 'all' || row.roomKey === roomKey);
+      const durationText = row => {
+        if (!Number.isFinite(row.durationMs)) return '';
+        const seconds = Math.floor(row.durationMs / 1000);
+        return ` · ${seconds >= 60 ? `${Math.floor(seconds / 60)}분 ` : ''}${seconds % 60}초 소요`;
+      };
       const paint = () => {
         const list = filtered();
         const pages = Math.max(1, Math.ceil(list.length / 8));
         page = Math.min(page, pages - 1);
         context.body.innerHTML = `<div class="simplerp-history-bar"><div class="simplerp-history-tabs" role="tablist">${[['current', '현재방'], ['all', '전체방']].map(([key, label]) => `<button type="button" role="tab" data-history-scope="${key}" aria-selected="${scope === key}" aria-pressed="${scope === key}">${label}</button>`).join('')}</div><span class="simplerp-history-retention">이력은 이 기기에만 저장됩니다.<br>최대 보관: 방별 5건 / 전체 50건</span><button type="button" data-history-clear ${list.length ? '' : 'disabled'}>일괄삭제</button></div>
-          <div class="simplerp-list">${list.slice(page * 8, page * 8 + 8).map(row => `<div class="simplerp-history-row" data-failed="${['failed', 'cancelled'].includes(row.outcome)}"><span>${icon('gpt')}</span><div><strong>${html(controller.api.models.find(item => item.id === row.model)?.name || row.model)} · ${html(REASONING_LABELS[row.reasoning] || '')} · ${GUIDE_LABELS[row.mode]}</strong><small>${scope === 'all' ? `${html(row.roomName)} · ` : ''}${new Date(row.createdAt).toLocaleString('ko-KR')}${row.outcome === 'failed' ? ' · 실패' : row.outcome === 'cancelled' ? ' · 중지' : row.outcome === 'compressed' ? ' · 압축으로 계속' : ''}</small></div>${row.error ? `<button type="button" class="simplerp-icon-btn simplerp-alert" data-history-error="${row.id}" aria-label="실패 내용">!</button>` : ''}<button type="button" class="simplerp-icon-btn" data-history-download="${row.id}" aria-label="응답 다운로드">${icon('download')}</button><button type="button" class="simplerp-icon-btn" data-history-diff="${row.id}" aria-label="적용 전후 비교">${icon('diff')}</button><button type="button" class="simplerp-icon-btn" data-history-delete="${row.id}" aria-label="이력 삭제">${icon('trash')}</button></div>`).join('') || '<p class="simplerp-empty">이력 없음</p>'}</div>
+          <div class="simplerp-list">${list.slice(page * 8, page * 8 + 8).map(row => `<div class="simplerp-history-row" data-failed="${['failed', 'cancelled'].includes(row.outcome)}"><span>${icon('gpt')}</span><div><strong>${html(controller.api.models.find(item => item.id === row.model)?.name || row.model)} · ${html(REASONING_LABELS[row.reasoning] || '')} · ${GUIDE_LABELS[row.mode]}${durationText(row)}</strong><small>${scope === 'all' ? `${html(row.roomName)} · ` : ''}${new Date(row.createdAt).toLocaleString('ko-KR')}${row.outcome === 'failed' ? ' · 실패' : row.outcome === 'cancelled' ? ' · 중지' : row.outcome === 'compressed' ? ' · 압축으로 계속' : ''}</small></div>${row.error ? `<button type="button" class="simplerp-icon-btn simplerp-alert" data-history-error="${row.id}" aria-label="실패 내용">!</button>` : ''}<button type="button" class="simplerp-icon-btn" data-history-download="${row.id}" aria-label="응답 다운로드">${icon('download')}</button><button type="button" class="simplerp-icon-btn" data-history-diff="${row.id}" aria-label="적용 전후 비교">${icon('diff')}</button><button type="button" class="simplerp-icon-btn" data-history-delete="${row.id}" aria-label="이력 삭제">${icon('trash')}</button></div>`).join('') || '<p class="simplerp-empty">이력 없음</p>'}</div>
           <div class="simplerp-history-page"><button type="button" data-page="-1" ${page ? '' : 'disabled'}>이전</button><small>${page + 1} / ${pages}</small><button type="button" data-page="1" ${page + 1 < pages ? '' : 'disabled'}>다음</button></div>`;
       };
       context.body.addEventListener('click', event => this.run(async () => {
