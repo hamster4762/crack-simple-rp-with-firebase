@@ -16,8 +16,8 @@
 // @connect      auth.openai.com
 // @connect      api.openai.com
 // @connect      raw.githubusercontent.com
-// @updateURL    https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js
-// @downloadURL  https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js
+// @updateURL    https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js
+// @downloadURL  https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23ffffff'%3E%3Cpath d='M3.2 18.9c2.4-.7 3.8-2.2 4.6-4.5.9-2.7 1.8-5.2 4.2-7.2 2.4-2 5.2-3.2 8.8-3.4-.4 1.9-1.2 3.8-2.4 5.2-1.1 1.3-2.5 2.2-4.1 2.8 1.7-.1 3.1-.5 4.3-1.1-.6 1.8-1.7 3.4-3.2 4.4-1.1.8-2.4 1.3-3.8 1.5 1.3.2 2.5.1 3.6-.2-.9 1.4-2.2 2.5-3.8 3.1-1.3.5-2.7.7-4.1.5 1 .5 2 .8 3.1.9-1.7.9-3.7 1.1-5.6.5-1-.3-1.6-1.2-1.6-2.5z'/%3E%3Cpath d='M8.2 16.8c1.9-.8 3.5-2 4.8-3.6-1.1 2.2-2.7 4-4.9 5.2-.6.3-1.2.5-1.8.7.7-.6 1.3-1.4 1.9-2.3z' fill='%23000000' fill-opacity='.22'/%3E%3Cpath d='M10.8 13.4c1.8-.7 3.4-1.8 4.8-3.2-1.2 2-2.8 3.5-4.9 4.5-.5.2-1 .4-1.5.5.6-.5 1.1-1.1 1.6-1.8z' fill='%23000000' fill-opacity='.22'/%3E%3C/svg%3E
 // ==/UserScript==
 
