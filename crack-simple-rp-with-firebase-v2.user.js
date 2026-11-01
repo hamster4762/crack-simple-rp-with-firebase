@@ -1789,7 +1789,7 @@ A → B 관계는 A가 B를 향한 의미·태도이며 B의 감정/인지를 �
 
   // ── 04. 외부 AI 지침과 JSON 출력 계약 ──
   const MEMORY_DELTA_GUIDE = String.raw`[변경분 JSON 출력]
-JSON 객체 하나만 출력하라. 파일·Markdown 코드블록·설명·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.
+결과는 JSON 객체 하나를 담은 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.
 최상위 필드는 format, schemaVersion, sourceUpdatedAt, lastTurn, baseHash, memory, deleted만 사용하라. format="simplerp-memory-delta", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn·baseHash는 요청 메타에서 그대로 복사하라.
 memory에는 추가·변경한 항목만 출력하라. 변경 없는 영역·항목을 재출력하지 마라. memory.dateLogs, memory.lore, memory.people의 각 목록에서 생략 또는 []는 변경 없음이고, 삭제는 deleted에만 명시하라. 변경도 삭제도 없으면 memory={}, deleted={}로 출력하라.
 목록에서 변경한 항목은 모든 필드를 포함한 완전한 객체로 출력하라. 각 항목 내부의 aliases·knowledge·concealments 등 배열은 변경 후 전체값을 써라. 기존의 유효한 내용을 빠뜨리지 마라.
@@ -1875,7 +1875,7 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
 출력 전: 제공 범위 끝까지 확인 / 마지막 턴 반영 / 지속 상태 보존·종료 근거 / 날짜·시간선·사건 인과 / 동일 인물·사실·자료 중복 / 모름과 미확인 / 공개·자기설명 수신자 누락 / 호칭·말투 현재값과 조건 / 관계 방향·전환·잔여 / 핵심 대사 원문 / 내부 참조 / JSON 완결성 모두 대조한다. 분석 과정·점검표·지침·스키마 설명 자체는 결과에 넣지 않는다.
 
 [SimpleRP 출력 계약]
-memory 네 영역의 최종 전체값을 JSON 객체 하나로 출력하라. 최상위 필드는 format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 써라. format="simplerp-memory", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. 필드를 생략하거나 변경분만 출력하지 마라. 근거가 없는 목록은 [], 현재상태는 빈 body로 써라. 파일·Markdown 코드블록·설명·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.
+memory 네 영역의 최종 전체값을 JSON 객체 하나로 작성하라. 최상위 필드는 format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 써라. format="simplerp-memory", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. 필드를 생략하거나 변경분만 출력하지 마라. 근거가 없는 목록은 [], 현재상태는 빈 body로 써라. 결과는 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.
 기존 항목 id는 입력값 그대로 써라. 신규 id는 종류별로 new-date-1/new-actor-1/new-fact-1/new-speech-1/new-relation-1/new-lore-1 형식으로 만들고 문서 안에서 중복하지 마라. 모든 인물 참조는 actors[].id를 써라. 한 참조에는 한 개인만 지정하고 이름·별칭·집단을 ID로 쓰지 마라.
 정확한 객체 구조:
 {
@@ -1979,7 +1979,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
 호칭/말투는 화자→상대의 현재값·유효 조건·변화 계기를 보존한다. 관계/감정선은 방향별 현재 의미·핵심 전환·현재 남은 쟁점·상대/공개의 인지 범위를 보존한다. 과거 전환과 현재값을 혼동하지 않는다.
 자료집은 반복 참조 설정·정체·기능·제약·장소·조직·규칙·핵심 대사를 유지한다. 사실/주장/소문/불확실성의 차이, 명칭·감지어와 조건·예외·부정·수치를 보존한다. 핵심 대사 인용은 원문을 임의로 고치지 않는다.
 압축률보다 의미 보존을 최우선한다. 출력 전 입력의 고유한 사실·현재 효력·사건 인과·인물별 정보격차·관계 방향·부정·조건·예외·수치·날짜·미해결 후속이 결과의 어디에 남았는지 대조한다. 통합·삭제한 각 항목의 고유 정보가 통합본에 빠짐없이 남았는지, 중복을 줄이려다 서로 다른 의미까지 합치지 않았는지 확인한다. 누락·과도한 일반화·참조 파손이 있으면 복구한다. 자체 분석·대조표·작업보고는 출력하지 않는다.
-format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 하나를 출력하라. format="simplerp-memory", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. memory에는 입력과 같은 필드 구조로 네 영역의 압축 후 전체값을 작성하라. 필드를 생략하거나 변경분만 출력하지 마라. 파일·코드블록·설명·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.`
+format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 하나를 작성하라. format="simplerp-memory", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. memory에는 입력과 같은 필드 구조로 네 영역의 압축 후 전체값을 작성하라. 필드를 생략하거나 변경분만 출력하지 마라. 결과는 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.`
   };
 
   // ── 05. 저장소와 원자적 구조 변환 ──
