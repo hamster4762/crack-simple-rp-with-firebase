@@ -3416,7 +3416,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
         const type = data.type || lines.find(line => line.startsWith('event:'))?.slice(6).trim();
         if (typeof type === 'string' && type.startsWith('response.')) responseEventSeen = true;
         eventTypes.push(typeof type === 'string' && /^[a-z][a-z0-9_.:-]{0,79}$/i.test(type)
-          ? siwcSafeText(type) : type == null ? '이벤트 이름 없음' : '이벤트 이름 형식 미지원');
+          ? type : type == null ? '이벤트 이름 없음' : '이벤트 이름 형식 미지원');
         if (eventTypes.length > 5) eventTypes.shift();
         if (type === 'response.failed' || type === 'error') throw siwcError(200, JSON.stringify({ error: data.response?.error || data.error || data }));
         if (type === 'response.incomplete') throw failure(`OpenAI 응답이 미완료 상태로 종료됐습니다.\n사유: ${data.response?.incomplete_details?.reason || '서버가 사유를 제공하지 않음'}`);
