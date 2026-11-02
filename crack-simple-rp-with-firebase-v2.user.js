@@ -3701,16 +3701,29 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       id: String(id),
       role,
       text,
+      turnId: raw.turnId || '',
+      parentTurnId: raw.parentTurnId || '',
       adopted: raw.isSelected !== false && raw.isDeleted !== true && raw.deleted !== true,
       complete: !['generating', 'pending', 'streaming'].includes(String(raw.status || '').toLowerCase())
     };
   }
   function completedHistory(oldestFirst) {
+    let messages = oldestFirst.filter(row => row.adopted && row.complete);
+    if (messages.at(-1)?.turnId) {
+      // 리롤 후보는 같은 부모에서 갈라진다. 최신 완료 메시지의 부모 경로만
+      // 채택하여 현재·과거 리롤 모두 한 답변만 남긴다. UUID는 턴수가 아니다.
+      const byTurnId = new Map(messages.filter(row => row.turnId).map(row => [row.turnId, row]));
+      const selected = new Set();
+      for (let message = messages.at(-1); message && !selected.has(message.turnId); message = byTurnId.get(message.parentTurnId)) {
+        selected.add(message.turnId);
+      }
+      messages = messages.filter(row => !row.turnId || selected.has(row.turnId));
+    }
     const turns = [];
     let pendingUser = null;
     const append = messages => turns.push({ number: turns.length + 1, messages });
     // USER+AI는 한 턴. 연속 AI와 답 없이 다음 USER로 넘어간 USER는 각각 한 턴.
-    for (const message of oldestFirst.filter(row => row.adopted && row.complete)) {
+    for (const message of messages) {
       if (message.role === 'user') {
         if (pendingUser) {
           append([pendingUser]);
@@ -3781,8 +3794,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       return this.hasOlder && (count < 10 || count === 10 && this.rows.at(-1)?.role === 'assistant');
     }
     compact() {
-      this.rows = this.rows.filter(message => message.adopted && message.complete &&
-        (message.role === 'user' || message.role === 'assistant' && message.text.trim()));
+      this.rows = completedHistory([...this.rows].reverse()).turns.flatMap(turn => turn.messages).reverse();
       if (this.rows.length > 22) {
         this.rows.length = 22;
         // 커서와 캐시 사이의 경계를 버렸으므로 그 커서를 이어 쓰지 않는다.
@@ -4325,7 +4337,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         if (this.turnCountCache) {
           const cachedTurns = this.turnCountCache.recent;
           // 최근 경계 밖 삭제·종류 불명 변경은 숫자를 추측하지 않는다.
-          // 집계 무효화만 하며 전체 조회는 다음 사용자 요청에서 수행한다.
+          // 집계 무효화만 하며 전체 조회는 자동구축 준비 또는 사용자 요청에서 수행한다.
           const knownDeletion = kind === 'deleted' && cachedTurns.slice(0, -1).some(turn => turn.messageIds.includes(messageId));
           if (kind === 'deleted' && !knownDeletion || !kind) {
             this.turnCountCache = null;
@@ -4372,13 +4384,13 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
     }
     async ensureAutoCount() {
-      if (!this.autoActive() || this.auto.job || this.auto.initialized || this.auto.countPromise) {
+      if (!this.autoActive() || this.auto.job || this.auto.initialized && this.turnCountCache || this.auto.countPromise) {
         return this.auto.countPromise;
       }
       const epoch = this.routeEpoch;
       const identity = this.identity;
       const sequence = this.messageChangeSequence;
-      this.auto.initialized = true;
+      this.auto.initialized = false;
       this.auto.countPromise = (async () => {
         if (!this.turnCountCache) {
           const assertActive = () => {
@@ -4387,7 +4399,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
               throw new SimpleRPError('자동구축 준비를 중지했습니다.', { code: 'CANCELLED' });
             }
             if (sequence !== this.messageChangeSequence) {
-              throw new SimpleRPError('집계 중 대화가 변경됐습니다. 바로실행에서 턴수를 확인하세요.');
+              throw new SimpleRPError('집계 중 대화가 변경됐습니다.', { code: 'CANCELLED' });
             }
           };
           const history = completedHistory(await this.adapter.readHistory(identity, assertActive));
@@ -4397,10 +4409,15 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         const target = (this.currentRoomCache?.lastBuild.lastTurn || 0) + this.settings.autoBuildPeriod;
         this.auto.observedTotal = this.turnCountCache.total;
         this.auto.due = this.turnCountCache.total > target;
+        this.auto.initialized = true;
       })().finally(() => {
         if (epoch === this.routeEpoch) {
           this.auto.countPromise = null;
           this.paint();
+          // 집계 도중 도착한 변경도 기존 메시지 갱신 경로에서 다시 확인한다.
+          if (sequence !== this.messageChangeSequence && this.autoActive() && !this.turnCountCache) {
+            this.scheduleRefresh();
+          }
         }
       });
       return this.auto.countPromise;
@@ -4409,12 +4426,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (!this.autoActive() || this.auto.job) {
         return;
       }
-      if (!this.auto.initialized) {
+      if (!this.auto.initialized || !this.turnCountCache) {
         void this.ensureAutoCount().catch(error => this.autoFailure(error));
-        return;
-      }
-      if (!this.turnCountCache) {
-        this.paint();
         return;
       }
       const total = this.turnCountCache.total;
