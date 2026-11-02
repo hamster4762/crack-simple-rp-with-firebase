@@ -3701,16 +3701,29 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       id: String(id),
       role,
       text,
+      turnId: raw.turnId || '',
+      parentTurnId: raw.parentTurnId || '',
       adopted: raw.isSelected !== false && raw.isDeleted !== true && raw.deleted !== true,
       complete: !['generating', 'pending', 'streaming'].includes(String(raw.status || '').toLowerCase())
     };
   }
   function completedHistory(oldestFirst) {
+    let messages = oldestFirst.filter(row => row.adopted && row.complete);
+    if (messages.at(-1)?.turnId) {
+      // 리롤 후보는 같은 부모에서 갈라진다. 최신 완료 메시지의 부모 경로만
+      // 채택하여 현재·과거 리롤 모두 한 답변만 남긴다. UUID는 턴수가 아니다.
+      const byTurnId = new Map(messages.filter(row => row.turnId).map(row => [row.turnId, row]));
+      const selected = new Set();
+      for (let message = messages.at(-1); message && !selected.has(message.turnId); message = byTurnId.get(message.parentTurnId)) {
+        selected.add(message.turnId);
+      }
+      messages = messages.filter(row => !row.turnId || selected.has(row.turnId));
+    }
     const turns = [];
     let pendingUser = null;
     const append = messages => turns.push({ number: turns.length + 1, messages });
     // USER+AI는 한 턴. 연속 AI와 답 없이 다음 USER로 넘어간 USER는 각각 한 턴.
-    for (const message of oldestFirst.filter(row => row.adopted && row.complete)) {
+    for (const message of messages) {
       if (message.role === 'user') {
         if (pendingUser) {
           append([pendingUser]);
@@ -3781,8 +3794,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       return this.hasOlder && (count < 10 || count === 10 && this.rows.at(-1)?.role === 'assistant');
     }
     compact() {
-      this.rows = this.rows.filter(message => message.adopted && message.complete &&
-        (message.role === 'user' || message.role === 'assistant' && message.text.trim()));
+      this.rows = completedHistory([...this.rows].reverse()).turns.flatMap(turn => turn.messages).reverse();
       if (this.rows.length > 22) {
         this.rows.length = 22;
         // 커서와 캐시 사이의 경계를 버렸으므로 그 커서를 이어 쓰지 않는다.
