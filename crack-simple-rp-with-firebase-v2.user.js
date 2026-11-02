@@ -4064,7 +4064,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       assertActive();
       const suffix = `${encodeURIComponent(identity.chatId)}/messages/${encodeURIComponent(messageId)}`;
-      const paths = [`https://contents-api.wrtn.ai/character-chat/v3/chats/${suffix}`, `https://crack-api.wrtn.ai/crack-gen/v3/chats/${suffix}`];
+      const paths = [`https://crack-api.wrtn.ai/crack-gen/v3/chats/${suffix}`, `https://contents-api.wrtn.ai/character-chat/v3/chats/${suffix}`];
       for (let index = 0; index < paths.length; index += 1) {
         let writeError;
         try {
