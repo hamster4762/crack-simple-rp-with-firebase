@@ -4325,7 +4325,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         if (this.turnCountCache) {
           const cachedTurns = this.turnCountCache.recent;
           // 최근 경계 밖 삭제·종류 불명 변경은 숫자를 추측하지 않는다.
-          // 집계 무효화만 하며 전체 조회는 다음 사용자 요청에서 수행한다.
+          // 집계 무효화만 하며 전체 조회는 자동구축 준비 또는 사용자 요청에서 수행한다.
           const knownDeletion = kind === 'deleted' && cachedTurns.slice(0, -1).some(turn => turn.messageIds.includes(messageId));
           if (kind === 'deleted' && !knownDeletion || !kind) {
             this.turnCountCache = null;
@@ -4372,13 +4372,13 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
     }
     async ensureAutoCount() {
-      if (!this.autoActive() || this.auto.job || this.auto.initialized || this.auto.countPromise) {
+      if (!this.autoActive() || this.auto.job || this.auto.initialized && this.turnCountCache || this.auto.countPromise) {
         return this.auto.countPromise;
       }
       const epoch = this.routeEpoch;
       const identity = this.identity;
       const sequence = this.messageChangeSequence;
-      this.auto.initialized = true;
+      this.auto.initialized = false;
       this.auto.countPromise = (async () => {
         if (!this.turnCountCache) {
           const assertActive = () => {
@@ -4387,7 +4387,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
               throw new SimpleRPError('자동구축 준비를 중지했습니다.', { code: 'CANCELLED' });
             }
             if (sequence !== this.messageChangeSequence) {
-              throw new SimpleRPError('집계 중 대화가 변경됐습니다. 바로실행에서 턴수를 확인하세요.');
+              throw new SimpleRPError('집계 중 대화가 변경됐습니다.', { code: 'CANCELLED' });
             }
           };
           const history = completedHistory(await this.adapter.readHistory(identity, assertActive));
@@ -4397,10 +4397,15 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         const target = (this.currentRoomCache?.lastBuild.lastTurn || 0) + this.settings.autoBuildPeriod;
         this.auto.observedTotal = this.turnCountCache.total;
         this.auto.due = this.turnCountCache.total > target;
+        this.auto.initialized = true;
       })().finally(() => {
         if (epoch === this.routeEpoch) {
           this.auto.countPromise = null;
           this.paint();
+          // 집계 도중 도착한 변경도 기존 메시지 갱신 경로에서 다시 확인한다.
+          if (sequence !== this.messageChangeSequence && this.autoActive() && !this.turnCountCache) {
+            this.scheduleRefresh();
+          }
         }
       });
       return this.auto.countPromise;
@@ -4409,12 +4414,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (!this.autoActive() || this.auto.job) {
         return;
       }
-      if (!this.auto.initialized) {
+      if (!this.auto.initialized || !this.turnCountCache) {
         void this.ensureAutoCount().catch(error => this.autoFailure(error));
-        return;
-      }
-      if (!this.turnCountCache) {
-        this.paint();
         return;
       }
       const total = this.turnCountCache.total;
