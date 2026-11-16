@@ -4906,6 +4906,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (saved.meta.roomKey === this.identity?.roomKey) {
         this.currentRoomCache = clone(saved);
         this.preview = null;
+        this.auto.initialized = false;
+        void this.ensureAutoCount().catch(error => this.autoFailure(error));
         this.paint();
         try {
           if (this.injection.intent) {
