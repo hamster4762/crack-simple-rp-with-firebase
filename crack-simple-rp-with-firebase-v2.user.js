@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      2.0.0.0
+// @version      2.0.0.1
 // @description  Crack 채팅의 기억을 정리하고 주입해 이야기의 연속성을 유지합니다. 로컬·Firebase 저장과 AI 기억 구축을 지원합니다. (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -10,7 +10,6 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @connect      crack-api.wrtn.ai
-// @connect      contents-api.wrtn.ai
 // @connect      firebaseio.com
 // @connect      firebasedatabase.app
 // @connect      auth.openai.com
@@ -1092,9 +1091,13 @@
       pinned: policy.pinned === true
     };
   }
-  function stripOwnBlock(raw) {
+  // toMessageEnd: 사용자 직접 해제 전용. 닫히지 않은 블록은 message 끝까지 제거한다.
+  function stripOwnBlock(raw, toMessageEnd = false) {
     let found = false;
-    const text = String(raw).replace(/\r?\n?<!-- simplerp-memory v=\d+(?: saved=\d+)?\r?\n[\s\S]*?-->/g, () => {
+    const block = toMessageEnd
+      ? /\r?\n?<!-- simplerp-memory v=\d+(?: saved=\d+)?\r?\n[\s\S]*?(?:-->|$)/g
+      : /\r?\n?<!-- simplerp-memory v=\d+(?: saved=\d+)?\r?\n[\s\S]*?-->/g;
+    const text = String(raw).replace(block, () => {
       found = true;
       return '';
     });
@@ -2539,10 +2542,15 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
                   : '인증과 접근 권한을 확인하세요.';
               let serverMessage = '';
               try {
-                const error = JSON.parse(response.responseText).error;
+                const parsed = JSON.parse(response.responseText);
+                const error = parsed?.error;
                 serverMessage = typeof error === 'string' ? error : [error?.status, error?.message,
                   ...(Array.isArray(error?.details) ? error.details.map(detail => detail.reason || detail.description || detail.message) : [])
                 ].filter(Boolean).join('\n');
+                // Crack은 최상위 message로 오류 사유를 보낸다(Crack 웹도 이 값을 표시).
+                if (!serverMessage && typeof parsed?.message === 'string') {
+                  serverMessage = parsed.message;
+                }
               } catch {
                 // JSON 오류 응답이 없을 때만 HTTP 상태별 안내를 사용한다.
               }
@@ -3854,7 +3862,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     }
     async request(method, url, body) {
       const parsedUrl = new URL(url);
-      if (!['crack-api.wrtn.ai', 'contents-api.wrtn.ai'].includes(parsedUrl.hostname) || parsedUrl.protocol !== 'https:') {
+      if (parsedUrl.hostname !== 'crack-api.wrtn.ai' || parsedUrl.protocol !== 'https:') {
         throw new SimpleRPError('허용하지 않는 Crack API 경로입니다.');
       }
       if (Date.now() < (this.retryAfterUntil || 0)) {
@@ -4046,7 +4054,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         // 최신 서버 원문에서 자신의 블록만 제거한다. 사전 단건 GET을 중복하지
         // 않으며 사용자 편집·다른 확프의 내용은 이 원문 그대로 보존한다.
         expected = fresh.text;
-        next = stripOwnBlock(expected).text;
+        next = stripOwnBlock(expected, savedUpdatedAt === null).text;
         if (next === expected) {
           return fresh.text;
         }
@@ -4057,46 +4065,19 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (fresh.role !== 'assistant' || fresh.text !== expected) {
         throw new SimpleRPError('carrier 원문이 변경됐습니다. 최신 원문으로 다시 준비하세요.');
       }
-      const removalOnly = stripOwnBlock(expected);
+      const removalOnly = stripOwnBlock(expected, removeOnly && savedUpdatedAt === null);
       const removingOwnBlock = removalOnly.found && removalOnly.text === next;
       if (!removingOwnBlock && selectCarrier(head)?.id !== messageId) {
         throw new SimpleRPError('주입 대상 턴이 변경됐습니다. 최신 대화로 다시 준비하세요.');
       }
       assertActive();
-      const suffix = `${encodeURIComponent(identity.chatId)}/messages/${encodeURIComponent(messageId)}`;
-      const paths = [`https://crack-api.wrtn.ai/crack-gen/v3/chats/${suffix}`, `https://contents-api.wrtn.ai/character-chat/v3/chats/${suffix}`];
-      for (let index = 0; index < paths.length; index += 1) {
-        let writeError;
-        try {
-          await this.request('PATCH', paths[index], {
-            message: next
-          });
-        } catch (error) {
-          writeError = error;
-        }
-        assertActive();
-        // 타임아웃도 이미 반영됐을 수 있다. 재조회 없이 다음 쓰기를 하지 않는다.
-        const checked = await this.readMessage(identity, messageId);
-        assertActive();
-        assertInjectionNotNewer([checked], savedUpdatedAt);
-        if (normalizeText(checked.text) === normalizeText(next)) {
-          return checked.text;
-        }
-        if (checked.text !== expected) {
-          throw new SimpleRPError('PATCH 후 원문이 예상과 다릅니다. 추가 쓰기를 중단했습니다. 서버 내용을 확인하세요.');
-        }
-        // 다음 서버 시도는 위 단건 조회로 미반영을 확인한 뒤에만 허용한다.
-        // 서버 장애·통신/응답 손상은 넘기되 인증·권한·요청 제한은 우회하지 않는다.
-        const canTryNext = writeError && (
-          [404, 405].includes(writeError.status) ||
-          writeError.status >= 500 && writeError.status < 600 ||
-          ['NETWORK', 'RESPONSE'].includes(writeError.code)
-        );
-        if (writeError && !canTryNext) {
-          throw writeError;
-        }
-      }
-      throw new SimpleRPError('Crack 메시지 수정이 서버에 반영되지 않았습니다. ON으로 표시하지 않습니다.');
+      // Crack 웹의 메시지 수정과 같은 경로로 한 번만 쓴다. 성공 응답은 그대로 반영하고,
+      // 실패는 재시도·재해석 없이 그대로 전달한다.
+      await this.request('PATCH', `https://crack-api.wrtn.ai/crack-gen/v3/chats/${encodeURIComponent(identity.chatId)}/messages/${encodeURIComponent(messageId)}`, {
+        message: next
+      });
+      assertActive();
+      return next;
     }
     composer() {
       const elements = document.querySelectorAll('.__chat_input_textarea[contenteditable="true"], textarea[placeholder*="메시지"]');
@@ -4163,7 +4144,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         }
         try {
           const url = new URL(String(input), location.href);
-          if (url.protocol !== 'https:' || !['crack-api.wrtn.ai', 'contents-api.wrtn.ai'].includes(url.hostname)) {
+          if (url.protocol !== 'https:' || url.hostname !== 'crack-api.wrtn.ai') {
             return null;
           }
           const match = /\/chats\/([^/]+)\/messages(?:\/([^/]+))?(?:\/|$)/.exec(url.pathname);
@@ -5209,15 +5190,15 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
             this.knownCarrierIds.delete(oldId);
           }
           if (raw.length > INJECTION_LIMIT) {
-            // 서버의 개행 정규화도 실제 raw 용량에 포함한다. 초과 결과를 ON으로 승격하지 않는다.
+            // 실제로 쓴 raw가 상한을 넘으면 ON으로 승격하지 않는다.
             await this.adapter.patchVerified(identity, carrier.id, raw,
               stripOwnBlock(raw).text, assertActive, false, saved.meta.updatedAt);
             this.injection.intent = false;
             this.injection.carrierId = '';
             this.knownCarrierIds.clear();
             this.preview = { ...selection, raw, over: true };
-            void this.ui?.confirm('주입 용량 초과', '서버에서 확인한 실제 원문이 40,000자를 넘어 주입을 해제했습니다.', [['close', '확인']]);
-            throw new SimpleRPError('서버 실제 raw가 주입 상한을 초과해 해제했습니다.');
+            void this.ui?.confirm('주입 용량 초과', '주입한 실제 원문이 40,000자를 넘어 주입을 해제했습니다.', [['close', '확인']]);
+            throw new SimpleRPError('주입한 실제 raw가 주입 상한을 초과해 해제했습니다.');
           }
           assertActive();
           for (const [messageId, text] of confirmedTexts) {
@@ -5248,7 +5229,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           };
           this.clearResolvedInjectionError(previousIssue);
           this.paint();
-          // 이번에 읽은 문맥에 서버가 확인한 수정 원문까지 반영한 목록만 반환한다.
+          // 이번에 읽은 문맥에 PATCH 성공한 수정 원문까지 반영한 목록만 반환한다.
           // 도중에 변경 신호가 있었으면 전송 준비에서 새로 조회한다.
           return headSequence === this.messageChangeSequence
             ? { head: confirmedHead, sequence: headSequence } : null;
@@ -5267,7 +5248,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     }
     async removeBlocks(identity, head, assertActive, savedUpdatedAt = this.currentRoomCache?.meta.updatedAt || 0) {
       assertInjectionNotNewer(head, savedUpdatedAt);
-      const ids = new Set([...this.knownCarrierIds, ...head.filter(message => stripOwnBlock(message.text).found).map(message => message.id)]);
+      const ids = new Set([...this.knownCarrierIds, ...head.filter(message => stripOwnBlock(message.text, savedUpdatedAt === null).found).map(message => message.id)]);
       for (const id of ids) {
         const text = await this.adapter.removeOwnBlockVerified(identity, id, assertActive, savedUpdatedAt);
         const message = this.messageCache.rows.find(row => row.id === id);
@@ -5276,16 +5257,18 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         }
       }
     }
-    async stopInjection(removeUnownedBlock = false) {
+    // userRequested: 사용자가 해제 버튼을 직접 누른 경우. 최신본 차단·검사 없이
+    // 다른 기기의 블록과 닫히지 않은 블록까지 모든 SimpleRP 블록을 제거한다.
+    async stopInjection(userRequested = false) {
       return this.queueOperation(async () => {
-        if (this.injection.blocked) {
+        if (this.injection.blocked && !userRequested) {
           throw new SimpleRPError(this.injection.error);
         }
         const epoch = this.routeEpoch;
         const identity = clone(this.identity);
         const previousIssue = this.injection.error;
         const assertActive = () => this.assertFrame(epoch, identity);
-        const savedUpdatedAt = this.currentRoomCache?.meta.updatedAt ?? (removeUnownedBlock ? null : 0);
+        const savedUpdatedAt = userRequested ? null : this.currentRoomCache?.meta.updatedAt ?? 0;
         // 해제 요청 후에는 실패해도 백그라운드 갱신이 다시 주입하지 않는다.
         this.injection.intent = false;
         this.auto.warning = '';
@@ -5295,7 +5278,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           const head = await this.adapter.readHistory(identity, assertActive);
           assertActive();
           await this.removeBlocks(identity, head, assertActive, savedUpdatedAt);
-          // 각 블록의 PATCH 후 단건 확인으로 완료 판정. 전체 기록 재조회 없음.
+          // 각 블록의 PATCH 성공으로 완료 판정. 전체 기록 재조회 없음.
           this.injection = {
             phase: 'OFF',
             intent: false,
@@ -7150,7 +7133,7 @@ button[aria-pressed=true], .simplerp-active {
       const selected = injected ? controller.injection.selected : result?.selected || [];
       const maximum = INJECTION_LIMIT;
       const over = raw.length > maximum || result?.over;
-      const needsRemoval = controller.injection.intent || controller.injection.unknown || controller.injection.carrierId;
+      const needsRemoval = controller.injection.intent || controller.injection.unknown || controller.injection.carrierId || controller.injection.blocked;
       const startDisabled = !needsRemoval && (controller.dirty || over || controller.injection.phase === 'PENDING');
       const percent = Math.min(100, raw.length / maximum * 100);
       return `<div class="simplerp-capacity simplerp-capacity-layout">
@@ -7482,11 +7465,11 @@ button[aria-pressed=true], .simplerp-active {
             return this.viewer('주입 내용', message.text, 'SimpleRP-carrier-raw.txt');
           }
         case 'injection':
-          if (controller.injection.phase === 'ON' || controller.injection.intent || controller.injection.unknown || controller.injection.carrierId) {
+          if (controller.injection.phase === 'ON' || controller.injection.intent || controller.injection.unknown || controller.injection.carrierId || controller.injection.blocked) {
             if (controller.auto.job && controller.auto.job.phase !== 'saving' && !(await this.stopAutoBuild())) {
               return;
             }
-            await controller.stopInjection(!controller.currentRoomCache && Boolean(controller.injection.carrierId));
+            await controller.stopInjection(true);
           } else {
             await controller.startInjection();
           }
