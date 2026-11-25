@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      2.0.0.1
+// @version      3.0.0.0
 // @description  Crack 채팅의 기억을 정리하고 주입해 이야기의 연속성을 유지합니다. 로컬·Firebase 저장과 AI 기억 구축을 지원합니다. (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -15,13 +15,12 @@
 // @connect      auth.openai.com
 // @connect      api.openai.com
 // @connect      raw.githubusercontent.com
-// @updateURL    https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js
-// @downloadURL  https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js
+// @downloadURL  none
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23ffffff'%3E%3Cpath d='M3.2 18.9c2.4-.7 3.8-2.2 4.6-4.5.9-2.7 1.8-5.2 4.2-7.2 2.4-2 5.2-3.2 8.8-3.4-.4 1.9-1.2 3.8-2.4 5.2-1.1 1.3-2.5 2.2-4.1 2.8 1.7-.1 3.1-.5 4.3-1.1-.6 1.8-1.7 3.4-3.2 4.4-1.1.8-2.4 1.3-3.8 1.5 1.3.2 2.5.1 3.6-.2-.9 1.4-2.2 2.5-3.8 3.1-1.3.5-2.7.7-4.1.5 1 .5 2 .8 3.1.9-1.7.9-3.7 1.1-5.6.5-1-.3-1.6-1.2-1.6-2.5z'/%3E%3Cpath d='M8.2 16.8c1.9-.8 3.5-2 4.8-3.6-1.1 2.2-2.7 4-4.9 5.2-.6.3-1.2.5-1.8.7.7-.6 1.3-1.4 1.9-2.3z' fill='%23000000' fill-opacity='.22'/%3E%3Cpath d='M10.8 13.4c1.8-.7 3.4-1.8 4.8-3.2-1.2 2-2.8 3.5-4.9 4.5-.5.2-1 .4-1.5.5.6-.5 1.1-1.1 1.6-1.8z' fill='%23000000' fill-opacity='.22'/%3E%3C/svg%3E
 // ==/UserScript==
 
 /*
- * 저장 데이터 스키마 버전: 2 (SCHEMA_VERSION; 설정 메뉴의 데이터구조 버전과 동일).
+ * 저장 데이터 스키마 버전: 3 (SCHEMA_VERSION; 설정 메뉴의 데이터구조 버전과 동일).
  * 아래는 저장 데이터 구조이며, 현재방 캐시·draft·주입 실행 상태는 포함하지 않는다.
  *
  * localStorage
@@ -45,18 +44,23 @@
  * │  ├─ autoBuildPeriod: 양의 정수 (기본 10)
  * │  └─ updatedAt: 저장시각 (Unix epoch 밀리초)
  * ├─ roomIndex [키: roomKey] → { name, updatedAt }
+ * ├─ presets [키: "library"] → { items[]: { id, title, triggers[], body }, updatedAt } (배열 순서 = 표시 순서)
+ * ├─ presetLinks [키: roomKey] → { items/{프리셋 ID}: { enabled?, pinned? }, updatedAt }
  * └─ meta
- *    ├─ schemaVersion: 2
+ *    ├─ schemaVersion: 3
  *    └─ updatedAt: 전체 복원·저장소 전환의 충돌 확인용 변경시각 (Unix epoch 밀리초)
  *
  * Firebase Realtime Database
  * └─ simpleRP
- *    ├─ schemaVersion: 2
- *    └─ v2
+ *    ├─ schemaVersion: 3
+ *    └─ v3
  *       ├─ roomIndex/{roomKey}: { name, updatedAt }
  *       ├─ rooms/{roomKey}
  *       │  ├─ meta: 아래 채팅방 meta와 동일
  *       │  └─ data: { lastBuild, memory, extras, selection }의 JSON 문자열
+ *       ├─ presets
+ *       │  ├─ library: { updatedAt, data: items의 JSON 문자열 }
+ *       │  └─ links/{roomKey}: { updatedAt, data: items의 JSON 문자열 }
  *       └─ settings
  *          ├─ updatedAt: 기기에서 생성한 저장시각 (Unix epoch 밀리초)
  *          └─ data: { customGuides, guideModes, autoBuildPeriod }의 JSON 문자열
@@ -101,7 +105,7 @@
   'use strict';
 
   // ── 01. 공통: 비밀을 콘솔에 출력하지 않고 비동기 작업의 출처를 고정한다. ──
-  const SCHEMA_VERSION = 2;
+  const SCHEMA_VERSION = 3;
   const INJECTION_LIMIT = 40000;
   const FIREBASE_SDK_VERSION = '12.5.0';
   const CONNECTION_KEY = 'simplerp-connection';
@@ -111,8 +115,9 @@
   const KNOWLEDGE_STATES = ['알고 있음', '모름', '추측', '오해', '미확인'];
   const GUIDES = ['full', 'continue', 'compress'];
   const SIWC_KEY = 'simplerp-siwc';
+  const VERSION_INFO_URL = 'https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/version.json';
   const MIGRATION_BASE_URL = 'https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/src/migrations/';
-  const MIGRATIONS = { 1: { file: 'schema-v2.js', hash: 'c5deb4513409882dd0cd5fce2ebc197ee37b0eaf179217cda8521009e2b59df1' } };
+  const MIGRATIONS = { 1: { file: 'schema-v2.js', hash: 'c5deb4513409882dd0cd5fce2ebc197ee37b0eaf179217cda8521009e2b59df1' }, 2: { file: 'schema-v3.js', hash: '8a62e8012355c581668732c6aaa20ac9977a7ea8276a553083006ade3b17c50c' } };
   const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
   const STOP_WORDS = new Set(['그리고', '하지만', '그래서', '그런데', '이제', '지금', '오늘', '여기', '저기', '사람', '인물', '정보', '사실', '정도', '그냥', '정말', '조금', '아직', '이미', '모든', '이번', '현재', '상황', '대화', '하는', '했다', '한다', '있다', '없다', '에게', '에서', '으로', '하다', 'that', 'this', 'with', 'from', 'have', 'just', 'then', 'there', 'here']);
   function clone(value) {
@@ -234,6 +239,18 @@
     }
     return String(value).slice(0, 80);
   }
+  // 자리마다 숫자로 비교한다. 1.19.0은 1.9.0보다 최신이다.
+  function compareVersions(left, right) {
+    const first = left.split('.').map(Number);
+    const second = right.split('.').map(Number);
+    for (let index = 0; index < Math.max(first.length, second.length); index += 1) {
+      const difference = (first[index] || 0) - (second[index] || 0);
+      if (difference) {
+        return difference;
+      }
+    }
+    return 0;
+  }
   async function sha256(value) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
     return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
@@ -261,6 +278,12 @@
       updatedAt: 0
     };
   }
+  function emptyPresetLibrary() {
+    return { items: [], updatedAt: 0 };
+  }
+  function emptyPresetLinks() {
+    return { items: {}, updatedAt: 0 };
+  }
   function emptyRoom(identity) {
     return {
       meta: {
@@ -287,7 +310,8 @@
     return {
       schemaVersion: SCHEMA_VERSION,
       rooms: {},
-      settings: emptySettings()
+      settings: emptySettings(),
+      presets: { library: emptyPresetLibrary(), links: {} }
     };
   }
   function hasConfiguredMemory(room) {
@@ -719,10 +743,10 @@
         this.string(item.content.full, `${path}.content.full`, true);
       });
     }
-    extras(items) {
-      this.array(items, 'extras');
+    extras(items, name = 'extras') {
+      this.array(items, name);
       items.forEach((item, index) => {
-        const path = `extras[${index}]`;
+        const path = `${name}[${index}]`;
         this.object(item, path, ['id', 'title', 'triggers', 'body']);
         this.id(item.id, `${path}.id`);
         this.string(item.title, `${path}.title`, true);
@@ -731,8 +755,32 @@
         item.triggers.forEach((word, wordIndex) => this.string(word, `${path}.triggers[${wordIndex}]`, true));
       });
     }
+    presetPolicy(policy, path) {
+      for (const field of ['enabled', 'pinned']) {
+        if (Object.hasOwn(policy, field)) {
+          this.boolean(policy[field], `${path}.${field}`);
+        }
+      }
+      if (policy.pinned && policy.enabled === false) {
+        this.fail(path, '고정 항목은 사용 ON이어야 합니다.', policy);
+      }
+    }
+    presetLibrary(library) {
+      this.object(library, 'presets.library', ['items', 'updatedAt']);
+      this.extras(library.items, 'presets.library.items');
+      this.number(library.updatedAt, 'presets.library.updatedAt');
+    }
+    presetLinks(links, path = 'presets.links') {
+      this.object(links, path, ['items', 'updatedAt']);
+      this.object(links.items, `${path}.items`, Object.keys(links.items || {}));
+      for (const [id, policy] of Object.entries(links.items)) {
+        this.object(policy, `${path}.items.${id}`, ['enabled', 'pinned']);
+        this.presetPolicy(policy, `${path}.items.${id}`);
+      }
+      this.number(links.updatedAt, `${path}.updatedAt`);
+    }
     async packet(packet) {
-      this.object(packet, '$', ['format', 'schemaVersion', 'sourceUpdatedAt', 'lastTurn', 'memory', 'extras']);
+      this.object(packet, '$', ['format', 'schemaVersion', 'sourceUpdatedAt', 'lastTurn', 'memory', 'extras', 'presets']);
       this.choice(packet.format, 'format', ['simplerp-memory']);
       this.choice(packet.schemaVersion, 'schemaVersion', [SCHEMA_VERSION]);
       this.number(packet.sourceUpdatedAt, 'sourceUpdatedAt');
@@ -740,6 +788,22 @@
       await this.memory(packet.memory);
       if (Object.hasOwn(packet, 'extras')) {
         this.extras(packet.extras);
+      }
+      if (Object.hasOwn(packet, 'presets')) {
+        this.array(packet.presets, 'presets');
+        const ids = new Set();
+        packet.presets.forEach((row, index) => {
+          const path = `presets[${index}]`;
+          this.object(row, path, ['id', 'title', 'hash', 'enabled', 'pinned']);
+          for (const name of ['id', 'title', 'hash']) {
+            this.string(row[name], `${path}.${name}`, true);
+          }
+          this.presetPolicy(row, path);
+          if (ids.has(row.id)) {
+            this.fail(`${path}.id`, '프리셋 ID가 중복됩니다.', row.id);
+          }
+          ids.add(row.id);
+        });
       }
       return packet;
     }
@@ -804,7 +868,7 @@
       return room;
     }
     async snapshot(snapshot) {
-      this.object(snapshot, '$', ['schemaVersion', 'rooms', 'settings']);
+      this.object(snapshot, '$', ['schemaVersion', 'rooms', 'settings', 'presets']);
       this.choice(snapshot.schemaVersion, 'schemaVersion', [SCHEMA_VERSION]);
       this.object(snapshot.rooms, 'rooms', Object.keys(snapshot.rooms || {}));
       for (const [key, room] of Object.entries(snapshot.rooms)) {
@@ -814,6 +878,15 @@
         }
       }
       this.settings(snapshot.settings);
+      this.object(snapshot.presets, 'presets', ['library', 'links']);
+      new SchemaValidator().presetLibrary(snapshot.presets.library);
+      this.object(snapshot.presets.links, 'presets.links', Object.keys(snapshot.presets.links || {}));
+      for (const [key, links] of Object.entries(snapshot.presets.links)) {
+        if (!/^[a-f0-9]{64}$/.test(key)) {
+          this.fail(`presets.links.${key}`, '정규화된 SHA-256 방 키가 필요합니다.', key);
+        }
+        this.presetLinks(links, `presets.links.${key}`);
+      }
       return snapshot;
     }
   }
@@ -1055,6 +1128,34 @@
     }
     return room.memory[path] || room.memory.people[path];
   }
+  function linkedPresets(presets) {
+    return presets.library.items.filter(item => Object.hasOwn(presets.links.items, item.id));
+  }
+  function presetsEqual(left, right) {
+    return equal(left?.library, right?.library) && equal(left?.links, right?.links);
+  }
+  // 주입 계산용. 저장 원본은 바꾸지 않고 연결한 프리셋을 기타 항목 앞에 합친다.
+  // 저장시각도 프리셋을 포함해야 다른 기기의 구본이 최신 주입을 되돌리지 않는다.
+  function roomWithPresets(room, presets) {
+    const { library, links } = presets;
+    return {
+      ...room,
+      meta: {
+        ...room.meta,
+        updatedAt: Math.max(room.meta.updatedAt, links.updatedAt, Object.keys(links.items).length ? library.updatedAt : 0)
+      },
+      extras: [...linkedPresets(presets), ...room.extras],
+      selection: { ...room.selection, itemPolicies: { ...room.selection.itemPolicies, ...links.items } }
+    };
+  }
+  function presetHash(item) {
+    return sha256(JSON.stringify([item.title, item.triggers, item.body]));
+  }
+  function portablePresets(presets) {
+    return Promise.all(linkedPresets(presets).map(async item => ({
+      id: item.id, title: item.title, hash: await presetHash(item), ...presets.links.items[item.id]
+    })));
+  }
   function portableRoom(room) {
     return {
       format: 'simplerp-memory',
@@ -1224,7 +1325,7 @@
     if (kind === 'lore') {
       return `### ${title} · ${item.type}\n${item.content.full}`;
     }
-    if (kind === 'extras') {
+    if (kind === 'extras' || kind === 'presets') {
       return `### ${title}\n${item.body}`;
     }
     return item.body || '';
@@ -1793,7 +1894,7 @@ A → B 관계는 A가 B를 향한 의미·태도이며 B의 감정/인지를 �
   // ── 04. 외부 AI 지침과 JSON 출력 계약 ──
   const MEMORY_DELTA_GUIDE = String.raw`[변경분 JSON 출력]
 결과는 JSON 객체 하나를 담은 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.
-최상위 필드는 format, schemaVersion, sourceUpdatedAt, lastTurn, baseHash, memory, deleted만 사용하라. format="simplerp-memory-delta", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn·baseHash는 요청 메타에서 그대로 복사하라.
+최상위 필드는 format, schemaVersion, sourceUpdatedAt, lastTurn, baseHash, memory, deleted만 사용하라. format="simplerp-memory-delta", schemaVersion=3으로 쓰고 sourceUpdatedAt·lastTurn·baseHash는 요청 메타에서 그대로 복사하라.
 memory에는 추가·변경한 항목만 출력하라. 변경 없는 영역·항목을 재출력하지 마라. memory.dateLogs, memory.lore, memory.people의 각 목록에서 생략 또는 []는 변경 없음이고, 삭제는 deleted에만 명시하라. 변경도 삭제도 없으면 memory={}, deleted={}로 출력하라.
 목록에서 변경한 항목은 모든 필드를 포함한 완전한 객체로 출력하라. 각 항목 내부의 aliases·knowledge·concealments 등 배열은 변경 후 전체값을 써라. 기존의 유효한 내용을 빠뜨리지 마라.
 기존 id와 인물 참조는 입력값 그대로 써라. 신규 id는 종류별로 new-date-1/new-actor-1/new-fact-1/new-speech-1/new-relation-1/new-lore-1 형식으로 만들고 문서 안에서 중복하지 마라. 모든 인물 참조는 기존 또는 이번에 추가하는 actors의 id를 써라.
@@ -1878,11 +1979,11 @@ name은 식별 가능한 대표 이름, triggers는 실제 사용된 이름·별
 출력 전: 제공 범위 끝까지 확인 / 마지막 턴 반영 / 지속 상태 보존·종료 근거 / 날짜·시간선·사건 인과 / 동일 인물·사실·자료 중복 / 모름과 미확인 / 공개·자기설명 수신자 누락 / 호칭·말투 현재값과 조건 / 관계 방향·전환·잔여 / 핵심 대사 원문 / 내부 참조 / JSON 완결성 모두 대조한다. 분석 과정·점검표·지침·스키마 설명 자체는 결과에 넣지 않는다.
 
 [SimpleRP 출력 계약]
-memory 네 영역의 최종 전체값을 JSON 객체 하나로 작성하라. 최상위 필드는 format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 써라. format="simplerp-memory", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. 필드를 생략하거나 변경분만 출력하지 마라. 근거가 없는 목록은 [], 현재상태는 빈 body로 써라. 결과는 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.
+memory 네 영역의 최종 전체값을 JSON 객체 하나로 작성하라. 최상위 필드는 format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 써라. format="simplerp-memory", schemaVersion=3으로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. 필드를 생략하거나 변경분만 출력하지 마라. 근거가 없는 목록은 [], 현재상태는 빈 body로 써라. 결과는 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.
 기존 항목 id는 입력값 그대로 써라. 신규 id는 종류별로 new-date-1/new-actor-1/new-fact-1/new-speech-1/new-relation-1/new-lore-1 형식으로 만들고 문서 안에서 중복하지 마라. 모든 인물 참조는 actors[].id를 써라. 한 참조에는 한 개인만 지정하고 이름·별칭·집단을 ID로 쓰지 마라.
 정확한 객체 구조:
 {
- "format":"simplerp-memory", "schemaVersion":2,
+ "format":"simplerp-memory", "schemaVersion":3,
  "sourceUpdatedAt":0, "lastTurn":0,
  "memory":{
    "currentState":{"body":"최종 전체 원문"},
@@ -1982,7 +2083,7 @@ JSON 공백 제거나 문장만 줄이는 작업으로 끝내지 않는다. 네 
 호칭/말투는 화자→상대의 현재값·유효 조건·변화 계기를 보존한다. 관계/감정선은 방향별 현재 의미·핵심 전환·현재 남은 쟁점·상대/공개의 인지 범위를 보존한다. 과거 전환과 현재값을 혼동하지 않는다.
 자료집은 반복 참조 설정·정체·기능·제약·장소·조직·규칙·핵심 대사를 유지한다. 사실/주장/소문/불확실성의 차이, 명칭·감지어와 조건·예외·부정·수치를 보존한다. 핵심 대사 인용은 원문을 임의로 고치지 않는다.
 압축률보다 의미 보존을 최우선한다. 출력 전 입력의 고유한 사실·현재 효력·사건 인과·인물별 정보격차·관계 방향·부정·조건·예외·수치·날짜·미해결 후속이 결과의 어디에 남았는지 대조한다. 통합·삭제한 각 항목의 고유 정보가 통합본에 빠짐없이 남았는지, 중복을 줄이려다 서로 다른 의미까지 합치지 않았는지 확인한다. 누락·과도한 일반화·참조 파손이 있으면 복구한다. 자체 분석·대조표·작업보고는 출력하지 않는다.
-format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 하나를 작성하라. format="simplerp-memory", schemaVersion=2로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. memory에는 입력과 같은 필드 구조로 네 영역의 압축 후 전체값을 작성하라. 필드를 생략하거나 변경분만 출력하지 마라. 결과는 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.`
+format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 하나를 작성하라. format="simplerp-memory", schemaVersion=3으로 쓰고 sourceUpdatedAt·lastTurn은 요청 메타에서 그대로 복사하라. memory에는 입력과 같은 필드 구조로 네 영역의 압축 후 전체값을 작성하라. 필드를 생략하거나 변경분만 출력하지 마라. 결과는 UTF-8 SimpleRP-memory.json 파일 하나로 제공하라. 파일 첨부를 지원하지 않는 환경에서만 JSON 본문으로 응답하라. 설명·Markdown 코드블록·들여쓰기를 넣지 마라. 문자열의 원문은 보존하고 문자열 안의 줄바꿈은 \n으로 표기하라.`
   };
 
   // ── 05. 저장소와 원자적 구조 변환 ──
@@ -2075,6 +2176,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           database.createObjectStore('settings');
           database.createObjectStore('meta');
           database.createObjectStore('roomIndex');
+          database.createObjectStore('presets');
+          database.createObjectStore('presetLinks');
           request.transaction.objectStore('meta').put(SCHEMA_VERSION, 'schemaVersion');
         };
         request.onsuccess = () => {
@@ -2153,6 +2256,43 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         throw storageDataError(this, error, 'settings[shared]', undefined);
       }
     }
+    async readPresets() {
+      const library = await this.readRecord('presets', 'library') ?? emptyPresetLibrary();
+      try {
+        new SchemaValidator().presetLibrary(library);
+        return library;
+      } catch (error) {
+        throw storageDataError(this, error, 'presets[library]', undefined);
+      }
+    }
+    async readPresetLinks(key) {
+      const links = await this.readRecord('presetLinks', key) ?? emptyPresetLinks();
+      try {
+        new SchemaValidator().presetLinks(links);
+        return links;
+      } catch (error) {
+        throw storageDataError(this, error, `presetLinks[${key}]`, undefined);
+      }
+    }
+    async listPresetLinks() {
+      const database = await this.open();
+      const [keys, values] = await new Promise((resolve, reject) => {
+        const transaction = database.transaction('presetLinks', 'readonly');
+        const store = transaction.objectStore('presetLinks');
+        const keyRequest = store.getAllKeys();
+        const valueRequest = store.getAll();
+        transaction.oncomplete = () => resolve([keyRequest.result, valueRequest.result]);
+        transaction.onabort = () => reject(new SimpleRPError('로컬 프리셋 연결 목록을 읽지 못했습니다.'));
+      });
+      try {
+        return Object.fromEntries(keys.map((key, index) => {
+          new SchemaValidator().presetLinks(values[index], `presetLinks[${key}]`);
+          return [key, values[index]];
+        }));
+      } catch (error) {
+        throw storageDataError(this, error, 'presetLinks', undefined);
+      }
+    }
     async listRooms() {
       const database = await this.open();
       return new Promise((resolve, reject) => {
@@ -2179,12 +2319,15 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     }
     async snapshot(validate = true) {
       const database = await this.open(validate);
-      if (!['rooms', 'settings', 'meta'].every(name => database.objectStoreNames.contains(name))) {
+      if (!['rooms', 'settings', 'presets', 'presetLinks', 'meta'].every(name => database.objectStoreNames.contains(name))) {
         throw storageDataError(this, new SimpleRPError('필수 저장소가 없습니다.'), 'IndexedDB.objectStores', undefined);
       }
       const result = await new Promise((resolve, reject) => {
-        const transaction = database.transaction(['rooms', 'settings', 'meta'], 'readonly');
+        const transaction = database.transaction(['rooms', 'settings', 'presets', 'presetLinks', 'meta'], 'readonly');
         const rooms = transaction.objectStore('rooms').getAll();
+        const library = transaction.objectStore('presets').get('library');
+        const linkKeys = transaction.objectStore('presetLinks').getAllKeys();
+        const links = transaction.objectStore('presetLinks').getAll();
         const roomKeys = validate ? null : transaction.objectStore('rooms').getAllKeys();
         const settings = transaction.objectStore('settings').get('shared');
         const stamp = transaction.objectStore('meta').get('updatedAt');
@@ -2193,6 +2336,9 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           rooms: rooms.result,
           roomKeys: roomKeys?.result,
           settings: settings.result,
+          library: library.result,
+          linkKeys: linkKeys.result,
+          links: links.result,
           version: version.result,
           stamp: stamp.result || 0
         });
@@ -2202,7 +2348,11 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         const snapshot = {
           schemaVersion: result.version ?? (result.rooms.length || result.settings !== undefined ? undefined : SCHEMA_VERSION),
           rooms: {},
-          settings: result.settings === undefined ? emptySettings() : result.settings
+          settings: result.settings === undefined ? emptySettings() : result.settings,
+          presets: {
+            library: result.library ?? emptyPresetLibrary(),
+            links: Object.fromEntries(result.linkKeys.map((key, index) => [key, result.links[index]]))
+          }
         };
         if (validate) {
           new SchemaValidator().choice(snapshot.schemaVersion, 'meta.schemaVersion', [SCHEMA_VERSION]);
@@ -2250,8 +2400,16 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
             rooms.clear();
             Object.values(converted.rooms).forEach(room => rooms.put(room));
             transaction.objectStore('settings').put(converted.settings, 'shared');
-            const index = request.result.createObjectStore('roomIndex');
+            for (const name of ['roomIndex', 'presets', 'presetLinks']) {
+              if (!request.result.objectStoreNames.contains(name)) {
+                request.result.createObjectStore(name);
+              }
+            }
+            const index = transaction.objectStore('roomIndex');
+            index.clear();
             Object.entries(makeRoomIndex(converted.rooms)).forEach(([key, meta]) => index.put(meta, key));
+            transaction.objectStore('presets').put(converted.presets.library, 'library');
+            Object.entries(converted.presets.links).forEach(([key, links]) => transaction.objectStore('presetLinks').put(links, key));
             metadata.put(SCHEMA_VERSION, 'schemaVersion');
           };
         };
@@ -2319,10 +2477,10 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         database.close();
       }
     }
-    async resetRawStorage(onBlocked) {
+    async resetRawStorage(onBlocked, allowNewer = false) {
       const version = await this.readRecoveryVersion();
-      if (version.schemaVersion > SCHEMA_VERSION || version.databaseVersion > SCHEMA_VERSION) {
-        throw new SimpleRPError('더 최신 데이터는 초기화할 수 없습니다. SimpleRP를 업데이트하세요.');
+      if (!allowNewer && (version.schemaVersion > SCHEMA_VERSION || version.databaseVersion > SCHEMA_VERSION)) {
+        throw new SimpleRPError('확인 중 더 최신 구조의 데이터로 변경됐습니다. 다시 확인하세요.');
       }
       if (this.resetting) {
         throw new SimpleRPError('이미 로컬 초기화 중입니다.');
@@ -2402,11 +2560,45 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         transaction.onabort = () => reject(failure || new SimpleRPError('로컬 지침 저장에 실패했습니다.'));
       });
     }
+    async savePresets(library, expectedUpdatedAt, overwrite = false) {
+      new SchemaValidator().presetLibrary(library);
+      return this.savePresetRecord('presets', 'library', library, expectedUpdatedAt, overwrite);
+    }
+    async savePresetLinks(key, links, expectedUpdatedAt, overwrite = false) {
+      new SchemaValidator().presetLinks(links);
+      return this.savePresetRecord('presetLinks', key, links, expectedUpdatedAt, overwrite);
+    }
+    async savePresetRecord(storeName, key, value, expectedUpdatedAt, overwrite) {
+      this.assertWritable();
+      const database = await this.open();
+      const saved = clone(value);
+      return new Promise((resolve, reject) => {
+        const transaction = database.transaction([storeName, 'meta'], 'readwrite');
+        const store = transaction.objectStore(storeName);
+        const metadata = transaction.objectStore('meta');
+        const request = store.get(key);
+        let failure;
+        request.onsuccess = () => {
+          const currentUpdatedAt = request.result?.updatedAt || 0;
+          if (!overwrite && currentUpdatedAt !== expectedUpdatedAt) {
+            failure = new ConflictError();
+            transaction.abort();
+            return;
+          }
+          saved.updatedAt = nextTimestamp(Math.max(value.updatedAt, currentUpdatedAt));
+          store.put(saved, key);
+          const stamp = metadata.get('updatedAt');
+          stamp.onsuccess = () => metadata.put(nextTimestamp(stamp.result || 0), 'updatedAt');
+        };
+        transaction.oncomplete = () => resolve(saved);
+        transaction.onabort = () => reject(failure || new SimpleRPError('로컬 프리셋 저장에 실패했습니다. 편집본은 유지됩니다. 저장 공간을 확인하세요.'));
+      });
+    }
     async deleteRoom(key, expectedUpdatedAt) {
       this.assertWritable();
       const database = await this.open();
       return new Promise((resolve, reject) => {
-        const transaction = database.transaction(['rooms', 'roomIndex', 'meta'], 'readwrite');
+        const transaction = database.transaction(['rooms', 'roomIndex', 'presetLinks', 'meta'], 'readwrite');
         const rooms = transaction.objectStore('rooms');
         const metadata = transaction.objectStore('meta');
         const request = rooms.get(key);
@@ -2419,6 +2611,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           }
           rooms.delete(key);
           transaction.objectStore('roomIndex').delete(key);
+          transaction.objectStore('presetLinks').delete(key);
           const stamp = metadata.get('updatedAt');
           stamp.onsuccess = () => metadata.put(nextTimestamp(stamp.result || 0), 'updatedAt');
         };
@@ -2436,9 +2629,12 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           room.meta.updatedAt = nextTimestamp(room.meta.updatedAt);
         });
         replacement.settings.updatedAt = nextTimestamp(replacement.settings.updatedAt);
+        for (const record of [replacement.presets.library, ...Object.values(replacement.presets.links)]) {
+          record.updatedAt = nextTimestamp(record.updatedAt);
+        }
       }
       return new Promise((resolve, reject) => {
-        const transaction = database.transaction(['rooms', 'roomIndex', 'settings', 'meta'], 'readwrite');
+        const transaction = database.transaction(['rooms', 'roomIndex', 'settings', 'presets', 'presetLinks', 'meta'], 'readwrite');
         const metadata = transaction.objectStore('meta');
         const stamp = metadata.get('updatedAt');
         let failure;
@@ -2455,6 +2651,10 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           index.clear();
           Object.entries(makeRoomIndex(replacement.rooms)).forEach(([key, meta]) => index.put(meta, key));
           transaction.objectStore('settings').put(replacement.settings, 'shared');
+          transaction.objectStore('presets').put(replacement.presets.library, 'library');
+          const links = transaction.objectStore('presetLinks');
+          links.clear();
+          Object.entries(replacement.presets.links).forEach(([key, value]) => links.put(value, key));
           metadata.put(nextTimestamp(stamp.result || 0), 'updatedAt');
           metadata.put(SCHEMA_VERSION, 'schemaVersion');
         };
@@ -2745,6 +2945,31 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     new SchemaValidator().settings(settings);
     return settings;
   }
+  function encodeFirebasePreset(record) {
+    return { updatedAt: record.updatedAt, data: JSON.stringify(record.items) };
+  }
+  async function decodeFirebasePreset(wire, path) {
+    const validator = new SchemaValidator();
+    validator.object(wire, path, ['updatedAt', 'data']);
+    validator.string(wire.data, `${path}.data`);
+    return { items: await JsonWork.run('parse', wire.data), updatedAt: wire.updatedAt };
+  }
+  async function decodeFirebasePresetLibrary(wire) {
+    if (wire === null || wire === undefined) {
+      return emptyPresetLibrary();
+    }
+    const library = await decodeFirebasePreset(wire, 'Firebase.presets.library');
+    new SchemaValidator().presetLibrary(library);
+    return library;
+  }
+  async function decodeFirebasePresetLinks(wire) {
+    if (wire === null || wire === undefined) {
+      return emptyPresetLinks();
+    }
+    const links = await decodeFirebasePreset(wire, 'Firebase.presets.links');
+    new SchemaValidator().presetLinks(links);
+    return links;
+  }
   class FirebaseRepository {
     constructor(identity) {
       this.backend = 'firebase';
@@ -2792,6 +3017,10 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       return {
         rooms: Object.fromEntries(Object.entries(snapshot.rooms).map(([key, room]) => [key, encodeFirebaseRoom(room)])),
         settings: encodeFirebaseSettings(snapshot.settings),
+        presets: {
+          library: encodeFirebasePreset(snapshot.presets.library),
+          links: Object.fromEntries(Object.entries(snapshot.presets.links).map(([key, links]) => [key, encodeFirebasePreset(links)]))
+        },
         roomIndex: makeRoomIndex(snapshot.rooms)
       };
     }
@@ -2803,10 +3032,13 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (before.data?.schemaVersion === SCHEMA_VERSION) {
         return;
       }
-      if (before.data?.schemaVersion !== 1) {
+      const version = before.data?.schemaVersion;
+      if (!Number.isInteger(version) || version < 1 || version > SCHEMA_VERSION) {
         throw new SimpleRPError('저장소 버전이 변경됐습니다. 새로고침하여 확인하세요.');
       }
-      const converted = await transformStoredSnapshot(before.data, 'firebase');
+      // v1은 루트에, v2부터는 버전별 하위 경로에 저장한다.
+      const source = version === 1 ? before.data : { schemaVersion: version, ...before.data[`v${version}`] };
+      const converted = await transformStoredSnapshot(source, 'firebase');
       try {
         await this.request('PUT', 'simpleRP', { schemaVersion: SCHEMA_VERSION, [`v${SCHEMA_VERSION}`]: this.encodeSnapshot(converted) }, before.etag);
       } catch (error) {
@@ -2898,6 +3130,42 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         throw storageDataError(this, error, path, undefined);
       }
     }
+    async readPresets() {
+      await this.ensureReady();
+      const path = `${this.root}/presets/library`;
+      const result = await this.request('GET', path);
+      this.etags.set(path, result.etag);
+      try {
+        return await decodeFirebasePresetLibrary(result.data);
+      } catch (error) {
+        throw storageDataError(this, error, path, undefined);
+      }
+    }
+    async readPresetLinks(key) {
+      await this.ensureReady();
+      const path = `${this.root}/presets/links/${key}`;
+      const result = await this.request('GET', path);
+      this.etags.set(path, result.etag);
+      try {
+        return await decodeFirebasePresetLinks(result.data);
+      } catch (error) {
+        throw storageDataError(this, error, path, undefined);
+      }
+    }
+    async listPresetLinks() {
+      await this.ensureReady();
+      const path = `${this.root}/presets/links`;
+      const { data } = await this.request('GET', path);
+      try {
+        const result = {};
+        for (const [key, wire] of Object.entries(data || {})) {
+          result[key] = await decodeFirebasePresetLinks(wire);
+        }
+        return result;
+      } catch (error) {
+        throw storageDataError(this, error, path, undefined);
+      }
+    }
     async listRooms() {
       await this.ensureReady();
       const { data } = await this.request('GET', `${this.root}/roomIndex`);
@@ -2917,7 +3185,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         };
       }
       if (!validate) {
-        return { snapshot: result.data, stamp: result.etag, emptyRoot: !Object.keys(result.data.rooms || {}).length && !result.data.settings?.updatedAt };
+        return { snapshot: result.data, stamp: result.etag, emptyRoot: !Object.keys(result.data.rooms || {}).length && !result.data.settings?.updatedAt && !result.data.presets?.library?.updatedAt };
       }
       return this.decodeSnapshot(result.data, result.etag);
     }
@@ -2925,7 +3193,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     // 추가 GET 없이, 이미 읽은 원본을 기존 복원/검증 경로로 전달한다.
     async decodeSnapshot(data, stamp) {
       try {
-        new SchemaValidator().object(data, 'Firebase', ['rooms', 'settings', 'roomIndex']);
+        new SchemaValidator().object(data, 'Firebase', ['rooms', 'settings', 'presets', 'roomIndex']);
         if (data.rooms !== undefined && data.rooms !== null) {
           new SchemaValidator().object(data.rooms, 'Firebase.rooms', Object.keys(data.rooms));
         }
@@ -2937,11 +3205,18 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           }
         }
         const settings = await decodeFirebaseSettings(data.settings);
+        new SchemaValidator().object(data.presets ?? {}, 'Firebase.presets', ['library', 'links']);
+        const links = {};
+        for (const [key, wire] of Object.entries(data.presets?.links || {})) {
+          links[key] = await decodeFirebasePresetLinks(wire);
+        }
+        const presets = { library: await decodeFirebasePresetLibrary(data.presets?.library), links };
         return {
           snapshot: {
             schemaVersion: SCHEMA_VERSION,
             rooms,
-            settings
+            settings,
+            presets
           },
           stamp
         };
@@ -2968,7 +3243,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       return { schemaVersion };
     }
-    async resetRawStorage(before) {
+    async resetRawStorage(before, allowNewer = false) {
       if (this.resetting) {
         throw new SimpleRPError('이미 Firebase 초기화 중입니다.');
       }
@@ -2978,9 +3253,9 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       // 실제 삭제 요청은 서버 권한과 확인 직전 원본의 ETag를 사용한다.
       this.resetting = true;
       const stored = JSON.parse(before.rawJSON);
-      if (stored?.schemaVersion > SCHEMA_VERSION) {
+      if (!allowNewer && stored?.schemaVersion > SCHEMA_VERSION) {
         this.resetting = false;
-        throw new SimpleRPError('더 최신 데이터는 이 버전에서 초기화할 수 없습니다. 확프를 업데이트하세요.');
+        throw new SimpleRPError('확인 중 더 최신 구조의 데이터로 변경됐습니다. 다시 확인하세요.');
       }
       try {
         try {
@@ -3046,6 +3321,21 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       await this.conditionalWrite(path, encodeFirebaseSettings(saved), this.etags.get(path), overwrite);
       return saved;
     }
+    async savePresets(library, expectedUpdatedAt, overwrite = false, expectedEtag) {
+      new SchemaValidator().presetLibrary(library);
+      return this.savePresetRecord(`${this.root}/presets/library`, library, expectedUpdatedAt, overwrite, expectedEtag);
+    }
+    async savePresetLinks(key, links, expectedUpdatedAt, overwrite = false, expectedEtag) {
+      new SchemaValidator().presetLinks(links);
+      return this.savePresetRecord(`${this.root}/presets/links/${key}`, links, expectedUpdatedAt, overwrite, expectedEtag);
+    }
+    async savePresetRecord(path, value, expectedUpdatedAt, overwrite, expectedEtag) {
+      await this.assertWriteAllowed();
+      const saved = clone(value);
+      saved.updatedAt = nextTimestamp(Math.max(value.updatedAt, expectedUpdatedAt));
+      await this.conditionalWrite(path, encodeFirebasePreset(saved), expectedEtag, overwrite);
+      return saved;
+    }
     async saveIndex(key, meta) {
       try {
         await this.request('PUT', `${this.root}/roomIndex/${key}`, meta ? { name: meta.name, updatedAt: meta.updatedAt } : null, undefined, { print: 'silent' });
@@ -3065,6 +3355,11 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       await this.conditionalWrite(path, null, this.etags.get(path));
       await this.saveIndex(key, null);
+      try {
+        await this.request('PUT', `${this.root}/presets/links/${key}`, null, undefined, { print: 'silent' });
+      } catch (error) {
+        this.onNotice?.(new SimpleRPError(`채팅방은 삭제됐지만 프리셋 연결을 삭제하지 못했습니다. ${errorMessage(error)}`));
+      }
     }
     async replace(snapshot, expectedEtag, refreshTimes = false, overwrite = false) {
       await this.assertWriteAllowed();
@@ -3076,6 +3371,9 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           room.meta.updatedAt = nextTimestamp(room.meta.updatedAt);
         }
         replacement.settings.updatedAt = nextTimestamp(replacement.settings.updatedAt);
+        for (const record of [replacement.presets.library, ...Object.values(replacement.presets.links)]) {
+          record.updatedAt = nextTimestamp(record.updatedAt);
+        }
       }
       await this.conditionalWrite(this.root, this.encodeSnapshot(replacement), expectedEtag, overwrite);
       this.etags.clear();
@@ -4279,6 +4577,13 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       this.draft = null;
       this.draftBase = null;
       this.draftEtag = undefined;
+      // { library, links, etags }. currentPresets는 현재방 주입용 저장본이며 객체째 교체한다.
+      this.currentPresets = null;
+      this.presetDraft = null;
+      this.presetBase = null;
+      // 화면 조회용 단순 메모리 캐시. 저장하지 않는다.
+      this.presetLinksCache = null;
+      this.roomNamesCache = null;
       this.settings = emptySettings();
       this.settingsLoaded = false;
       this.settingsDraft = null;
@@ -4336,11 +4641,14 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       this.adapter.onSendFailure = (error, text, replay) => this.ui?.sendFailure(error, text, replay);
     }
     get dirty() {
-      return Boolean(this.draft && this.draftBase && !equal(this.draft, this.draftBase));
+      return Boolean(this.draft && this.draftBase && (!equal(this.draft, this.draftBase) || !presetsEqual(this.presetDraft, this.presetBase)));
+    }
+    get injectionRoom() {
+      return this.currentRoomCache && roomWithPresets(this.currentRoomCache, this.currentPresets);
     }
     get currentDraftDirty() {
       const suspended = this.suspendedDrafts.get(this.identity?.roomKey);
-      return this.showingCurrentRoom && this.dirty || Boolean(suspended && !equal(suspended.draft, suspended.base));
+      return this.showingCurrentRoom && this.dirty || Boolean(suspended && (!equal(suspended.draft, suspended.base) || !presetsEqual(suspended.presets, suspended.presetBase)));
     }
     assertEditable(roomKey = this.draft?.meta.roomKey) {
       if (this.auto.job && (!roomKey || roomKey === this.auto.job.roomKey)) {
@@ -4542,7 +4850,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           });
           assertActive();
           const responsePacket = await JsonWork.run('parse', lastRaw);
-          if (responsePacket?.sourceUpdatedAt !== source.sourceUpdatedAt || responsePacket?.lastTurn !== source.lastTurn || Object.hasOwn(responsePacket || {}, 'extras')) {
+          if (responsePacket?.sourceUpdatedAt !== source.sourceUpdatedAt || responsePacket?.lastTurn !== source.lastTurn || Object.hasOwn(responsePacket || {}, 'extras') || Object.hasOwn(responsePacket || {}, 'presets')) {
             throw new SimpleRPError('AI 응답의 요청 시각·마지막 턴·변경 영역이 요청과 다릅니다. 적용하지 않았습니다.');
           }
           if (mode !== 'continue' && responsePacket.format === 'simplerp-memory-delta') {
@@ -4558,7 +4866,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         await new SchemaValidator().room(candidate);
         const capacity = () => {
           const carrier = selectCarrier(this.messageCache.messages());
-          return selectInjection(candidate, this.recentTurns, '', carrier ? stripOwnBlock(carrier.text).text : '');
+          return selectInjection(roomWithPresets(candidate, this.currentPresets), this.recentTurns, '', carrier ? stripOwnBlock(carrier.text).text : '');
         };
         if (capacity().over) {
           entries.push({ mode, outcome: 'compressed', durationMs: Math.round(performance.now() - stageStartedAt), before: historyBefore, after: portableRoom(candidate) });
@@ -4740,13 +5048,18 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       const epoch = this.routeEpoch;
       this.loadingCurrent = true;
       if (this.dirty) {
-        this.suspendedDrafts.set(this.draft.meta.roomKey, { draft: this.draft, base: this.draftBase, etag: this.draftEtag });
+        this.suspendedDrafts.set(this.draft.meta.roomKey, { draft: this.draft, base: this.draftBase, etag: this.draftEtag, presets: this.presetDraft, presetBase: this.presetBase });
         this.ui?.showNotice('미저장 편집본을 유지했습니다. 채팅방 목록에서 다시 열 수 있습니다.');
       }
       this.identity = null;
       this.draft = null;
       this.draftBase = null;
+      this.presetDraft = null;
+      this.presetBase = null;
       this.currentRoomCache = null;
+      this.currentPresets = null;
+      this.presetLinksCache = null;
+      this.roomNamesCache = null;
       this.draftEtag = undefined;
       this.preview = null;
       this.recentTurns = [];
@@ -4780,8 +5093,9 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         }
         const identity = { ...route, roomKey, accountScope };
         this.identity = identity;
-        const [room, settings] = await Promise.all([
+        const [room, presets, settings] = await Promise.all([
           this.repository.readRoom(roomKey),
+          this.loadPresets(roomKey),
           this.settingsLoaded ? this.settings : this.repository.readSettings()
         ]);
         this.assertFrame(epoch, identity);
@@ -4791,6 +5105,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           this.ui.shadow.querySelectorAll('[data-storage-error-trigger]').forEach(button => button.remove());
         }
         this.currentRoomCache = room ? clone(room) : null;
+        this.currentPresets = presets;
         this.settings = settings;
         this.settingsLoaded = true;
         if (!this.dirty) {
@@ -4803,6 +5118,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           };
           this.draft = room ? clone(room) : emptyRoom(metadata);
           this.draftBase = clone(this.draft);
+          this.presetDraft = clone(presets);
+          this.presetBase = clone(presets);
           this.draftEtag = this.repository.etags?.get(`${this.repository.root}/rooms/${roomKey}`);
           this.auto.roomName = name;
         }
@@ -4817,7 +5134,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           return;
         }
         if (this.dirty) {
-          this.suspendedDrafts.set(this.draft.meta.roomKey, { draft: this.draft, base: this.draftBase, etag: this.draftEtag });
+          this.suspendedDrafts.set(this.draft.meta.roomKey, { draft: this.draft, base: this.draftBase, etag: this.draftEtag, presets: this.presetDraft, presetBase: this.presetBase });
         }
         this.draft = null;
         this.draftBase = null;
@@ -4842,6 +5159,45 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       // edit는 주입 cache/raw/ON을 변경하지 않는다. OFF 후보는 명시된 저장본만 사용.
       this.paint();
     }
+    async loadPresets(roomKey, repository = this.repository) {
+      const [library, links] = await Promise.all([repository.readPresets(), repository.readPresetLinks(roomKey)]);
+      return {
+        library, links,
+        etags: {
+          library: repository.etags?.get(`${repository.root}/presets/library`),
+          links: repository.etags?.get(`${repository.root}/presets/links/${roomKey}`)
+        }
+      };
+    }
+    async loadPresetUsage() {
+      if (!this.presetLinksCache) {
+        const repository = this.repository;
+        const epoch = this.routeEpoch;
+        const links = await repository.listPresetLinks();
+        if (repository === this.repository && epoch === this.routeEpoch) {
+          this.presetLinksCache = links;
+        }
+      }
+    }
+    async loadRoomNames() {
+      if (!this.roomNamesCache) {
+        const repository = this.repository;
+        const epoch = this.routeEpoch;
+        const rows = await repository.listRooms();
+        if (repository === this.repository && epoch === this.routeEpoch) {
+          this.roomNamesCache = new Map(rows.map(row => [row.roomKey, row.name]));
+        }
+      }
+    }
+    // 조회 중인 방은 편집본, 나머지 방은 캐시한 저장본 기준. 조회 전에는 null.
+    presetRooms(id) {
+      if (!this.presetLinksCache) {
+        return null;
+      }
+      const roomKey = this.draft.meta.roomKey;
+      const keys = Object.entries(this.presetLinksCache).filter(([key, links]) => key !== roomKey && Object.hasOwn(links.items, id)).map(([key]) => key);
+      return Object.hasOwn(this.presetDraft.links.items, id) ? [roomKey, ...keys] : keys;
+    }
     async chooseRoom(key) {
       if (!(await this.ui.allowDiscardDraft())) {
         return false;
@@ -4859,8 +5215,11 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (!room) {
         throw new SimpleRPError('채팅방 데이터가 삭제됐습니다. 목록을 다시 확인하세요.');
       }
+      const presets = suspended?.presets || (key === this.identity?.roomKey ? this.currentPresets : await this.loadPresets(key));
       this.draft = clone(room);
       this.draftBase = clone(suspended?.base || room);
+      this.presetDraft = clone(presets);
+      this.presetBase = clone(suspended?.presetBase || presets);
       this.draftEtag = suspended ? suspended.etag : this.repository.etags?.get(`${this.repository.root}/rooms/${key}`);
       this.suspendedDrafts.delete(key);
       // 다른 방 read는 currentRoomCache에 할당하지 않는다.
@@ -4873,26 +5232,82 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (!this.dirty) {
         return;
       }
-      if (!hasConfiguredMemory(this.draft) && !this.draftBase.meta.updatedAt) {
-        throw new SimpleRPError('기억이 없는 채팅방은 저장하지 않습니다.');
+      const roomKey = this.draft.meta.roomKey;
+      const repository = this.repository;
+      const presets = this.presetDraft;
+      const assertSource = () => {
+        if (repository !== this.repository || this.presetDraft !== presets || this.draft?.meta.roomKey !== roomKey) {
+          throw new SimpleRPError('저장 중 채팅방 또는 저장소가 바뀌었습니다. 해당 채팅방에서 남은 편집을 다시 저장하세요.');
+        }
+      };
+      let libraryChanged = false;
+      let roomSaved = false;
+      let linksSaved = false;
+      let completed = true;
+      let failure = null;
+      // 각각 저장한다. 중간에 실패하면 저장된 부분만 확정하고 나머지는 편집본으로 남긴다.
+      // 연결만 한 새 방도 주입·목록에 필요하므로 방 데이터를 연결보다 먼저 저장한다.
+      try {
+        if (!equal(this.presetDraft.library, this.presetBase.library)) {
+          libraryChanged = await this.savePresetPart('library', repository, roomKey);
+          completed = libraryChanged;
+        }
+        assertSource();
+        const linked = linkedPresets(presets).length > 0;
+        const unsavedLinkedRoom = linked && !this.draftBase.meta.updatedAt;
+        if (completed && (unsavedLinkedRoom || !equal(this.draft, this.draftBase))) {
+          if (!linked && !hasConfiguredMemory(this.draft) && !this.draftBase.meta.updatedAt) {
+            throw new SimpleRPError('기억이 없는 채팅방은 저장하지 않습니다.');
+          }
+          roomSaved = await this.saveRoomPart(repository);
+          completed = roomSaved;
+        }
+        assertSource();
+        if (completed && !equal(presets.links, this.presetBase.links)) {
+          linksSaved = await this.savePresetPart('links', repository, roomKey);
+          completed = linksSaved;
+        }
+      } catch (error) {
+        failure = error;
       }
+      if (repository === this.repository && this.currentRoomCache && this.identity && (libraryChanged || (roomSaved || linksSaved) && roomKey === this.identity.roomKey)) {
+        this.preview = null;
+        if (roomSaved && roomKey === this.identity.roomKey) {
+          this.auto.initialized = false;
+          void this.ensureAutoCount().catch(error => this.autoFailure(error));
+        }
+        this.paint();
+        try {
+          if (this.injection.intent) {
+            await this.reconcile('saved');
+          } else {
+            await this.refreshCurrent(false);
+          }
+        } catch (error) {
+          failure ??= new SimpleRPError(`저장은 완료했지만 주입/채팅 상태 확인에 실패했습니다. ${errorMessage(error)}`);
+        }
+      }
+      this.paint();
+      if (failure) {
+        throw failure;
+      }
+      return completed;
+    }
+    async saveRoomPart(repository) {
       const originalDraft = this.draft;
       const snapshot = clone(originalDraft);
       const expected = this.draftBase.meta.updatedAt;
       const expectedEtag = this.draftEtag;
-      const repository = this.repository;
-      const assertSource = () => {
+      const saved = await this.ui.withOverwriteConfirmation(overwrite => {
         if (repository !== this.repository || this.draft !== originalDraft || !equal(this.draft, snapshot)) {
           throw new SimpleRPError('저장 확인 중 편집본 또는 저장소가 바뀌었습니다. 다시 저장하세요.');
         }
-      };
-      const saved = await this.ui.withOverwriteConfirmation(overwrite => {
-        assertSource();
         return repository.saveRoom(snapshot, expected, overwrite, expectedEtag);
       });
       if (!saved) {
         return false;
       }
+      this.roomNamesCache = null;
       if (this.draft === originalDraft) {
         this.draftEtag = repository.etags?.get(`${repository.root}/rooms/${saved.meta.roomKey}`);
       }
@@ -4905,21 +5320,46 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       if (saved.meta.roomKey === this.identity?.roomKey) {
         this.currentRoomCache = clone(saved);
-        this.preview = null;
-        this.auto.initialized = false;
-        void this.ensureAutoCount().catch(error => this.autoFailure(error));
-        this.paint();
-        try {
-          if (this.injection.intent) {
-            await this.reconcile('saved');
-          } else {
-            await this.refreshCurrent(false);
-          }
-        } catch (error) {
-          throw new SimpleRPError(`기억 저장은 완료했지만 주입/채팅 상태 확인에 실패했습니다. ${errorMessage(error)}`);
+      }
+      return true;
+    }
+    // part: 'library' | 'links'
+    async savePresetPart(part, repository, roomKey) {
+      const original = this.presetDraft;
+      const base = this.presetBase;
+      const snapshot = clone(original[part]);
+      const expected = base[part].updatedAt;
+      if (part === 'links') {
+        // 연결을 모두 해제해도 이전에 주입한 저장시각보다 과거로 돌아가지 않게 한다.
+        snapshot.updatedAt = Math.max(snapshot.updatedAt, original.library.updatedAt);
+      }
+      const saved = await this.ui.withOverwriteConfirmation(overwrite => {
+        if (repository !== this.repository || this.presetDraft !== original || !equal(original[part].items, snapshot.items)) {
+          throw new SimpleRPError('저장 확인 중 편집본 또는 저장소가 바뀌었습니다. 다시 저장하세요.');
+        }
+        return part === 'library'
+          ? repository.savePresets(snapshot, expected, overwrite, base.etags.library)
+          : repository.savePresetLinks(roomKey, snapshot, expected, overwrite, base.etags.links);
+      });
+      if (!saved) {
+        return false;
+      }
+      const etag = repository.etags?.get(`${repository.root}/presets/${part === 'library' ? part : `links/${roomKey}`}`);
+      // 저장 중 추가로 편집한 내용은 유지하고 저장 기준만 갱신한다.
+      original[part].updatedAt = saved.updatedAt;
+      base[part] = clone(saved);
+      base.etags[part] = etag;
+      if (repository === this.repository) {
+        if (this.currentPresets && (part === 'library' || roomKey === this.identity?.roomKey)) {
+          this.currentPresets = {
+            ...this.currentPresets, [part]: clone(saved),
+            etags: { ...this.currentPresets.etags, [part]: etag }
+          };
+        }
+        if (part === 'links' && this.presetLinksCache) {
+          this.presetLinksCache[roomKey] = clone(saved);
         }
       }
-      this.paint();
       return true;
     }
     async saveSettings() {
@@ -4970,7 +5410,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         const head = await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
         this.assertFrame(epoch, identity);
         if (this.currentRoomCache) {
-          assertInjectionNotNewer(head, this.currentRoomCache.meta.updatedAt);
+          assertInjectionNotNewer(head, this.injectionRoom.meta.updatedAt);
         }
         if (sequence === this.messageChangeSequence) {
           this.updateTurnCount(head);
@@ -5037,7 +5477,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         // 갱신 작업이 직접 계산할 후보는 미리 중복 계산하지 않는다. 저장 시에는
         // preview를 비우므로, 로그가 그대로여도 새 저장본으로 후보를 계산한다.
         if (stable && this.currentRoomCache && !this.adapter.generation && !needsReconcile && (changed || recover || !this.preview)) {
-          this.preview = selectInjection(this.currentRoomCache, this.recentTurns, '', stripOwnBlock(stable.text).text);
+          this.preview = selectInjection(this.injectionRoom, this.recentTurns, '', stripOwnBlock(stable.text).text);
         }
         if (needsReconcile) {
           await this.reconcile('observed');
@@ -5117,10 +5557,12 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         const previousIssue = this.injection.error;
         // 저장 캐시는 편집하지 않고 저장/방 전환 시 객체째 교체한다. 읽기 전용
         // 참조를 고정하고 동일 객체인지 검증하여 매 턴 전체 기억 복제를 피한다.
-        const saved = this.currentRoomCache;
+        const savedRoom = this.currentRoomCache;
+        const savedPresets = this.currentPresets;
+        const saved = this.injectionRoom;
         const assertActive = () => {
           this.assertFrame(epoch, identity);
-          if (!this.injection.intent || this.currentRoomCache !== saved) {
+          if (!this.injection.intent || this.currentRoomCache !== savedRoom || this.currentPresets !== savedPresets) {
             throw new SimpleRPError('주입 중 저장 기준이 변경됐습니다. 다시 갱신하세요.');
           }
         };
@@ -5248,7 +5690,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         }
       });
     }
-    async removeBlocks(identity, head, assertActive, savedUpdatedAt = this.currentRoomCache?.meta.updatedAt || 0) {
+    async removeBlocks(identity, head, assertActive, savedUpdatedAt = this.injectionRoom?.meta.updatedAt || 0) {
       assertInjectionNotNewer(head, savedUpdatedAt);
       const ids = new Set([...this.knownCarrierIds, ...head.filter(message => stripOwnBlock(message.text, savedUpdatedAt === null).found).map(message => message.id)]);
       for (const id of ids) {
@@ -5270,7 +5712,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         const identity = clone(this.identity);
         const previousIssue = this.injection.error;
         const assertActive = () => this.assertFrame(epoch, identity);
-        const savedUpdatedAt = userRequested ? null : this.currentRoomCache?.meta.updatedAt ?? 0;
+        const savedUpdatedAt = userRequested ? null : this.injectionRoom?.meta.updatedAt ?? 0;
         // 해제 요청 후에는 실패해도 백그라운드 갱신이 다시 주입하지 않는다.
         this.injection.intent = false;
         this.auto.warning = '';
@@ -5295,7 +5737,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           const carrier = selectCarrier(recent);
           // 해제로 갱신한 캐시에서 후보를 복구한다. 추가 서버 조회는 하지 않는다.
           this.preview = carrier && this.currentRoomCache
-            ? selectInjection(this.currentRoomCache, this.recentTurns, '', stripOwnBlock(carrier.text).text)
+            ? selectInjection(this.injectionRoom, this.recentTurns, '', stripOwnBlock(carrier.text).text)
             : null;
           this.clearResolvedInjectionError(previousIssue);
         } catch (error) {
@@ -5527,11 +5969,42 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         request?.identity.roomKey === before.meta.roomKey && packet.lastTurn !== request.source.lastTurn);
       const after = applyMemoryPacket(before, packet);
       await new SchemaValidator().room(after);
+      const presetsBefore = clone(this.presetDraft);
+      const presetsAfter = clone(presetsBefore);
+      const diff = await buildDiff(before, after, Object.hasOwn(packet, 'extras'));
+      if (Object.hasOwn(packet, 'presets')) {
+        // 같은 ID와 내용의 프리셋만 연결한다. 실패한 항목의 기존 연결은 건드리지 않는다.
+        const failures = [];
+        presetsAfter.links.items = {};
+        for (const { id, title, hash, ...policy } of packet.presets) {
+          const item = presetsBefore.library.items.find(row => row.id === id);
+          if (item && await presetHash(item) === hash) {
+            presetsAfter.links.items[id] = policy;
+            continue;
+          }
+          if (Object.hasOwn(presetsBefore.links.items, id)) {
+            presetsAfter.links.items[id] = presetsBefore.links.items[id];
+          }
+          failures.push({
+            type: 'fail', kind: 'presets', title, before: null, after: null,
+            reason: item ? '프리셋 내용이 JSON을 내보낸 이후 수정됐습니다.' : '이 저장소에 해당 프리셋이 없습니다.'
+          });
+        }
+        // 연결 순서는 데이터가 아니므로 공용 프리셋 순서로 비교한다.
+        const rows = presets => linkedPresets(presets).map(item => {
+          const policy = presets.links.items[item.id];
+          return { id: item.id, title: item.title, enabled: policy.enabled !== false, pinned: policy.pinned === true };
+        });
+        const changes = await diffItems(rows(presetsBefore), rows(presetsAfter), before, after, 'presets');
+        diff.presets = [...failures, ...changes.filter(change => change.type !== 'modify' || !equal(change.before, change.after)).map(change => ({ ...change, moved: false }))];
+      }
       return {
         before,
         after,
+        presetsBefore,
+        presetsAfter,
         staleSource,
-        diff: await buildDiff(before, after, Object.hasOwn(packet, 'extras'))
+        diff
       };
     }
   }
@@ -5568,6 +6041,10 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     "key": "<circle cx=\"8\" cy=\"8\" r=\"5\"/><path d=\"m12 12 9 9m-3-3 3-3m-6 0 3-3\"/>",
     "diff": "<path d=\"M8 3v18m-4-4 4 4 4-4M16 21V3m-4 4 4-4 4 4\"/>",
     "undo": "<path d=\"M3 10a9 9 0 1 1 2.7 8M3 4v6h6\"/>",
+    "link": "<path d=\"M10 14a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-1 1M14 10a4 4 0 0 0-6 0l-3 3a4 4 0 0 0 6 6l1-1\"/>",
+    "up": "<path d=\"M12 20V5m-6 6 6-6 6 6\"/>",
+    "down": "<path d=\"M12 4v15m-6-6 6 6 6-6\"/>",
+    "update": "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 17V7m-4 4 4-4 4 4\"/>",
     "help": "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M9 8a3 3 0 0 1 6 1c0 2-3 2-3 4m0 3h.01\"/>",
     "flame": "<path d=\"M12 2c1 5 6 6 6 11a6 6 0 0 1-12 0c0-3 2-5 3-7 0 3 1 4 2 4 2-2 2-5 1-8Z\"/><path d=\"M12 12c-2 2-3 3-3 5a3 3 0 0 0 6 0c0-2-2-3-3-5Z\"/>"
   };
@@ -6429,6 +6906,9 @@ button[aria-pressed=true], .simplerp-active {
 .simplerp-diff-delete {
     color: #f19ba7;
 }
+.simplerp-diff-fail {
+    color: #f19ba7;
+}
 .simplerp-diff-modify {
     color: #e6ca77;
 }
@@ -6652,6 +7132,7 @@ button[aria-pressed=true], .simplerp-active {
       this.controller = controller;
       this.currentTab = 'home';
       this.peopleTab = 'facts';
+      this.extrasTab = 'room';
       this.selectedActor = '';
       this.actorListOpen = false;
       this.visibleRows = 100;
@@ -6801,6 +7282,12 @@ button[aria-pressed=true], .simplerp-active {
                 .simplerp-history-tabs [aria-pressed=true] { border-color:var(--simplerp-line); background:#263248; color:var(--simplerp-accent); }
                 .simplerp-history-retention { font-size:9px; line-height:1.5; color:var(--simplerp-muted); }
                 .simplerp-history-bar > button { margin-left:auto; flex-shrink:0; font-size:10px; padding:4px 6px; }
+                .simplerp-history-bar > .simplerp-actions { margin-left:auto; }
+                .simplerp-record summary > .simplerp-icon { width:14px; height:14px; flex-shrink:0; color:var(--simplerp-accent); }
+                .simplerp-preset-rooms summary { cursor:pointer; font-size:12px; }
+                .simplerp-preset-rooms summary small { color:var(--simplerp-muted); }
+                .simplerp-preset-rooms ul { margin:6px 0 0; padding-left:20px; max-height:160px; overflow:auto; font-size:12px; }
+                @media(max-width:650px) { .simplerp-preset .simplerp-icon-btn { width:24px; padding:3px; } .simplerp-preset summary { gap:3px; } }
                 .simplerp-history-row { display:flex; align-items:center; gap:6px; padding:8px 2px; border-bottom:1px solid var(--simplerp-line); }
                 .simplerp-history-row > div { flex:1; min-width:0; }
                 .simplerp-history-row strong, .simplerp-history-row small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -6934,13 +7421,14 @@ button[aria-pressed=true], .simplerp-active {
       if (!this.controller.dirty) {
         return true;
       }
-      const choice = await this.confirm('미저장 변경', '수정한 채팅방 데이터가 있습니다.', [['cancel', '계속 편집'], ['discard', '폐기'], ['save', '저장']]);
+      const choice = await this.confirm('미저장 변경', '저장하지 않은 수정사항이 있습니다.', [['cancel', '계속 편집'], ['discard', '폐기'], ['save', '저장']]);
       if (choice === 'save') {
         await this.controller.saveDraft();
         return !this.controller.dirty;
       }
       if (choice === 'discard') {
         this.controller.draft = clone(this.controller.draftBase);
+        this.controller.presetDraft = clone(this.controller.presetBase);
         this.controller.paint();
         return true;
       }
@@ -7109,6 +7597,7 @@ button[aria-pressed=true], .simplerp-active {
       const issue = controller.injection.error || this.persistentError || this.storageIssue || controller.auto.warning;
       const autoWarningOnly = controller.auto.warning && !controller.injection.error && !this.persistentError && !this.storageIssue;
       const actions = [
+        this.update ? iconButton('update', '업데이트', 'update', 'style="color:#8fd0a8"') : '',
         issue ? `<button type="button" class="simplerp-icon-btn ${autoWarningOnly ? 'simplerp-auto-warning' : 'simplerp-alert'}" data-action="error-details" aria-label="오류 상세">!</button>` : '',
         iconButton('rooms', '전체 데이터 목록', 'list', room ? '' : 'disabled'),
         iconButton('api-settings', '자동구축 API 설정', 'gpt', controller.api.settings ? 'style="color:#b5a0df"' : ''),
@@ -7221,13 +7710,15 @@ button[aria-pressed=true], .simplerp-active {
         relationships: '관계·감정선',
         actors: '인물',
         lore: '자료집',
-        extras: '기타'
+        extras: '기타',
+        presets: '공용 프리셋'
       }[kind] || kind;
     }
     rowControls(item, kind, pin = true) {
-      const policy = policyOf(this.controller.draft, item);
+      const shared = kind === 'presets';
+      const policy = policyOf(shared ? { selection: { itemPolicies: this.controller.presetDraft.links.items } } : this.controller.draft, item);
       const attributes = `data-id="${html(item.id)}" data-kind="${kind}"`;
-      return switchButton('item-enabled', `${this.kindLabel(kind)} 사용`, policy.enabled, `${attributes} ${policy.pinned ? 'disabled' : ''}`, policy.pinned) + (pin ? iconButton('item-pinned', '고정', 'pin', `${attributes} aria-pressed="${policy.pinned}" style="color:${policy.pinned ? '#efd3a3' : '#98a6bd'}"`) : '') + iconButton('item-edit', '편집', 'edit', attributes);
+      return switchButton('item-enabled', `${this.kindLabel(kind)} 사용`, policy.enabled, `${attributes} ${policy.pinned ? 'disabled' : ''}`, policy.pinned) + (pin ? iconButton('item-pinned', '고정', 'pin', `${attributes} aria-pressed="${policy.pinned}" style="color:${policy.pinned ? '#efd3a3' : '#98a6bd'}"`) : '') + iconButton('item-edit', shared ? '공용 프리셋 탭에서 편집' : '편집', 'edit', `${attributes} ${shared ? 'disabled' : ''}`);
     }
     record(item, kind, title = null, controls = true, pin = true) {
       const room = this.controller.draft;
@@ -7235,7 +7726,7 @@ button[aria-pressed=true], .simplerp-active {
       const body = kind === 'state' ? item.body : itemBody(room, item, kind);
       this.recordData.set(key, { item, kind, body });
       const excluded = this.controller.showingCurrentRoom && this.controller.preview?.excluded.some(row => row.id === item.id);
-      const typeChip = kind === 'lore' ? `<span class="simplerp-tag simplerp-tag-lore">${html(item.type)}</span>` : '';
+      const typeChip = kind === 'lore' ? `<span class="simplerp-tag simplerp-tag-lore">${html(item.type)}</span>` : kind === 'presets' ? icon('link') : '';
       return `<details class="simplerp-record" data-record="${html(key)}"><summary>${typeChip}<span class="simplerp-record-title">${html(title || itemTitle(room, item, kind))}</span><small class="simplerp-record-meta">${displayCount(body.length)}자</small>${excluded ? '<small class="simplerp-record-meta">용량 후보</small>' : ''}${controls ? this.rowControls(item, kind, pin) : iconButton('state-edit', '편집', 'edit', `data-state-key="${html(item.key)}"`)}</summary><div class="simplerp-record-body" data-record-body></div></details>`;
     }
     mountRecord(details) {
@@ -7265,7 +7756,7 @@ button[aria-pressed=true], .simplerp-active {
         body.innerHTML = `<dl class="simplerp-record-fields">${fields().filter(([, value]) => value).map(([label, value]) => `<dt>${html(label)}</dt><dd>${html(value)}</dd>`).join('')}</dl>`;
         return;
       }
-      const source = kind === 'state' || kind === 'extras' ? item.body : kind === 'dateLogs' ? item.summary : kind === 'lore' ? item.content.full : record.body;
+      const source = kind === 'state' || kind === 'extras' || kind === 'presets' ? item.body : kind === 'dateLogs' ? item.summary : kind === 'lore' ? item.content.full : record.body;
       if (source.length < 16000) {
         body.textContent = source;
       } else {
@@ -7309,9 +7800,35 @@ button[aria-pressed=true], .simplerp-active {
       return `<div class="simplerp-toolbar"><input class="simplerp-search" data-lore-search aria-label="자료 검색" placeholder="검색" value="${html(this.search)}"><select aria-label="자료 종류" data-lore-type style="width:86px"><option value="">전체</option>${LORE_TYPES.map(type => `<option ${this.loreType === type ? 'selected' : ''}>${type}</option>`).join('')}</select><div class="simplerp-actions">${iconButton('help', '자료집 도움말', 'help', 'data-help="lore"')}${iconButton('item-add', '자료 추가', 'plus', 'data-kind="lore"')}</div></div><div class="simplerp-list">${rows.slice(0, this.visibleRows).map(item => this.record(item, 'lore')).join('') || '<p class="simplerp-empty">자료 없음</p>'}</div>${this.moreRows(rows.length)}`;
     }
     extrasView() {
-      const room = this.controller.draft;
-      const characters = room.extras.filter(item => policyOf(room, item).enabled).reduce((sum, item) => sum + item.body.length, 0);
-      return `<div class="simplerp-toolbar"><small class="simplerp-record-meta">${displayCount(characters)}자</small><div class="simplerp-actions">${iconButton('help', '기타 도움말', 'help', 'data-help="extras"')}${iconButton('item-add', '기타 추가', 'plus', 'data-kind="extras"')}</div></div><div class="simplerp-list">${room.extras.slice(0, this.visibleRows).map(item => this.record(item, 'extras')).join('') || '<p class="simplerp-empty">기타 없음</p>'}</div>${this.moreRows(room.extras.length)}`;
+      const controller = this.controller;
+      const room = controller.draft;
+      const presets = controller.presetDraft;
+      const shared = this.extrasTab === 'shared';
+      const linked = linkedPresets(presets);
+      const items = shared ? presets.library.items : [
+        ...linked.filter(item => presets.links.items[item.id].enabled !== false),
+        ...room.extras.filter(item => policyOf(room, item).enabled)
+      ];
+      const characters = items.reduce((sum, item) => sum + item.body.length, 0);
+      const rows = shared
+        ? presets.library.items.map(item => () => this.presetRecord(item))
+        : [...linked.map(item => () => this.record(item, 'presets')), ...room.extras.map(item => () => this.record(item, 'extras'))];
+      return `<div class="simplerp-history-bar"><div class="simplerp-history-tabs" role="tablist">${[['room', '이 채팅방'], ['shared', '공용 프리셋']].map(([key, label]) => `<button type="button" role="tab" data-action="extras-tab" data-tab="${key}" aria-selected="${this.extrasTab === key}" aria-pressed="${this.extrasTab === key}">${label}</button>`).join('')}</div><small class="simplerp-record-meta">${displayCount(characters)}자</small><div class="simplerp-actions">${iconButton('help', shared ? '공용 프리셋 도움말' : '기타 도움말', 'help', `data-help="${shared ? 'presets' : 'extras'}"`)}${shared ? iconButton('preset-add', '공용 프리셋 추가', 'plus') : iconButton('item-add', '기타 추가', 'plus', 'data-kind="extras"')}</div></div><div class="simplerp-list">${rows.slice(0, this.visibleRows).map(row => row()).join('') || `<p class="simplerp-empty">${shared ? '공용 프리셋' : '기타'} 없음</p>`}</div>${this.moreRows(rows.length)}`;
+    }
+    presetRecord(item) {
+      const presets = this.controller.presetDraft;
+      const index = presets.library.items.indexOf(item);
+      const linked = Object.hasOwn(presets.links.items, item.id);
+      const body = itemBody(this.controller.draft, item, 'presets');
+      const attributes = `data-id="${html(item.id)}"`;
+      this.recordData.set(item.id, { item, kind: 'presets', body });
+      return `<details class="simplerp-record simplerp-preset" data-record="${html(item.id)}"><summary><span class="simplerp-record-title">${html(item.title)}</span><small class="simplerp-record-meta">${this.controller.presetRooms(item.id)?.length ?? '…'}개 방</small><small class="simplerp-record-meta">${displayCount(body.length)}자</small>${iconButton('preset-up', '위로', 'up', `${attributes} ${index ? '' : 'disabled'}`)}${iconButton('preset-down', '아래로', 'down', `${attributes} ${index + 1 < presets.library.items.length ? '' : 'disabled'}`)}${iconButton('preset-link', linked ? '이 채팅방 연결 해제' : '이 채팅방에 연결', 'link', `${attributes} aria-pressed="${linked}" style="color:${linked ? '#efd3a3' : '#98a6bd'}"`)}${iconButton('preset-edit', '편집', 'edit', attributes)}</summary><div class="simplerp-record-body" data-record-body></div></details>`;
+    }
+    async loadPresetUsage() {
+      if (!this.controller.presetLinksCache) {
+        await this.controller.loadPresetUsage();
+        this.render();
+      }
     }
     mountLauncher() {
       // Crack 기본 단축어 버튼의 그룹에 추가한다. 간격 클래스·전송 아이콘·
@@ -7371,7 +7888,7 @@ button[aria-pressed=true], .simplerp-active {
     async action(action, button) {
       const controller = this.controller;
       const room = controller.draft;
-      if (['rename', 'state-enabled', 'date-auto', 'item-enabled', 'item-pinned', 'state-text', 'state-add', 'item-add', 'item-edit', 'import'].includes(action)) {
+      if (['rename', 'state-enabled', 'date-auto', 'item-enabled', 'item-pinned', 'state-text', 'state-add', 'item-add', 'item-edit', 'preset-add', 'preset-edit', 'preset-up', 'preset-down', 'preset-link', 'import'].includes(action)) {
         controller.assertEditable();
       }
       switch (action) {
@@ -7388,6 +7905,9 @@ button[aria-pressed=true], .simplerp-active {
           return controller.auto.job ? this.stopAutoBuild() : this.openAutoRun();
         case 'error-details':
           return this.openErrorDetails(button);
+        case 'update':
+          this.helpPopover?.remove();
+          return this.openUpdate();
         case 'storage-backup':
         case 'storage-reset': {
           const issue = this.storageIssue;
@@ -7424,10 +7944,45 @@ button[aria-pressed=true], .simplerp-active {
           this.currentTab = button.dataset.tab;
           this.visibleRows = 100;
           this.render();
+          if (this.currentTab === 'extras' && this.extrasTab === 'shared') {
+            await this.loadPresetUsage();
+          }
           if (this.currentTab === 'home' && controller.showingCurrentRoom && controller.currentRoomCache) {
             await controller.refreshCurrent(Boolean(controller.injection.unknown), true);
           }
           return;
+        case 'extras-tab':
+          this.extrasTab = button.dataset.tab;
+          this.visibleRows = 100;
+          this.render();
+          if (this.extrasTab === 'shared') {
+            await this.loadPresetUsage();
+          }
+          return;
+        case 'preset-add':
+          return this.editPreset(null);
+        case 'preset-edit':
+          return this.editPreset(button.dataset.id);
+        case 'preset-up':
+        case 'preset-down': {
+          const items = controller.presetDraft.library.items;
+          const index = items.findIndex(item => item.id === button.dataset.id);
+          const [item] = items.splice(index, 1);
+          items.splice(action === 'preset-up' ? index - 1 : index + 1, 0, item);
+          controller.edited();
+          return;
+        }
+        case 'preset-link': {
+          const links = controller.presetDraft.links.items;
+          if (Object.hasOwn(links, button.dataset.id)) {
+            // 저장본의 연결을 해제했다가 되돌리면 이전 사용·고정 설정도 복원한다.
+            delete links[button.dataset.id];
+          } else {
+            links[button.dataset.id] = clone(controller.presetBase.links.items[button.dataset.id] || {});
+          }
+          controller.edited();
+          return;
+        }
         case 'people-tab':
           this.peopleTab = button.dataset.tab;
           this.render();
@@ -7487,13 +8042,16 @@ button[aria-pressed=true], .simplerp-active {
         case 'item-enabled':
         case 'item-pinned':
           {
-            const item = sameItemList(room, button.dataset.kind).find(row => row.id === button.dataset.id);
+            const shared = button.dataset.kind === 'presets';
+            const items = shared ? controller.presetDraft.library.items : sameItemList(room, button.dataset.kind);
+            const policies = shared ? controller.presetDraft.links.items : room.selection.itemPolicies;
+            const item = items.find(row => row.id === button.dataset.id);
             if (!item) {
               return;
             }
-            const current = policyOf(room, item);
+            const current = policyOf({ selection: { itemPolicies: policies } }, item);
             const policy = {
-              ...(room.selection.itemPolicies[item.id] || {})
+              ...(policies[item.id] || {})
             };
             if (action === 'item-pinned') {
               policy.pinned = !current.pinned;
@@ -7503,7 +8061,7 @@ button[aria-pressed=true], .simplerp-active {
             } else if (!current.pinned) {
               policy.enabled = !current.enabled;
             }
-            room.selection.itemPolicies[item.id] = policy;
+            policies[item.id] = policy;
             controller.edited();
             return;
           }
@@ -7682,6 +8240,74 @@ button[aria-pressed=true], .simplerp-active {
         }
       }[kind];
     }
+    fitContentEditor(context) {
+      // 모바일 키보드는 visual viewport만 줄일 수 있다. 열린 편집창에서만 높이를 맞춘다.
+      const fitContentEditor = () => {
+        const textarea = context.body.querySelector('.simplerp-content-editor');
+        const viewportHeight = window.visualViewport?.height || window.innerHeight;
+        const editorHeight = Math.min(260, Math.floor(viewportHeight * 0.45));
+        textarea.style.height = `${editorHeight}px`;
+        textarea.style.minHeight = `${Math.min(130, editorHeight)}px`;
+        textarea.style.maxHeight = `${Math.floor(viewportHeight * 0.55)}px`;
+      };
+      fitContentEditor();
+      window.visualViewport?.addEventListener('resize', fitContentEditor);
+      context.cleanups.push(() => window.visualViewport?.removeEventListener('resize', fitContentEditor));
+    }
+    editPreset(id) {
+      const controller = this.controller;
+      const presets = controller.presetDraft;
+      const existing = presets.library.items.find(item => item.id === id);
+      const working = existing ? clone(existing) : this.blankItem('extras');
+      let context;
+      const apply = async items => {
+        controller.assertEditable();
+        const library = { ...presets.library, items };
+        new SchemaValidator().presetLibrary(library);
+        if (controller.presetDraft !== presets) {
+          throw new SimpleRPError('편집 대상이 변경됐습니다.');
+        }
+        presets.library = library;
+        controller.edited();
+        await this.closeModal(context);
+      };
+      const remove = async () => {
+        await controller.loadPresetUsage();
+        const count = controller.presetRooms(id)?.length || 0;
+        if ((await this.confirm('공용 프리셋 삭제', `${existing.title} 항목을 편집본에서 삭제할까요?${count ? `\n저장하면 사용 중인 ${count}개 방에서 모두 제거됩니다.` : ''}`)) === 'apply') {
+          await apply(presets.library.items.filter(item => item.id !== id));
+        }
+      };
+      context = this.modal(`공용 프리셋 ${existing ? '편집' : '추가'}`, '', [...(existing ? [['삭제', remove]] : []), ['취소', () => this.closeModal(context)], ['적용', () => {
+        const next = clone(working);
+        return apply(existing ? presets.library.items.map(item => item.id === id ? next : item) : [...presets.library.items, next]);
+      }, true]]);
+      context.body.innerHTML = this.field('title', '제목', working.title, 'text', true) + this.field('triggers', '감지어 (쉼표로 구분)', working.triggers.join(', ')) + this.field('body', '내용', working.body, 'textarea', true)
+        + (existing ? `<details class="simplerp-nested-row simplerp-preset-rooms"><summary>사용 중인 채팅방</summary><ul></ul></details>` : '');
+      context.body.querySelectorAll('[data-field]').forEach(control => control.addEventListener('input', () => {
+        working[control.dataset.field] = control.dataset.field === 'triggers' ? splitWords(control.value) : control.value;
+      }));
+      const details = context.body.querySelector('.simplerp-preset-rooms');
+      details?.addEventListener('toggle', () => {
+        if (!details.open) {
+          return;
+        }
+        const list = details.querySelector('ul');
+        list.innerHTML = '<li>목록 읽는 중</li>';
+        void this.run(async () => {
+          try {
+            await Promise.all([controller.loadPresetUsage(), controller.loadRoomNames()]);
+          } catch (error) {
+            details.open = false;
+            throw error;
+          }
+          const draft = controller.draft;
+          const keys = draft && controller.presetRooms(id) || [];
+          list.innerHTML = keys.map(key => `<li>${html(key === draft.meta.roomKey ? draft.meta.name : controller.roomNamesCache?.get(key) || '이름 확인 불가')}</li>`).join('') || '<li>없음</li>';
+        });
+      });
+      this.fitContentEditor(context);
+    }
     editItem(kind, id) {
       const room = this.controller.draft;
       const existing = sameItemList(room, kind).find(item => item.id === id);
@@ -7834,18 +8460,7 @@ button[aria-pressed=true], .simplerp-active {
       };
       render();
       if (kind === 'lore' || kind === 'extras') {
-        // 모바일 키보드는 visual viewport만 줄일 수 있다. 열린 편집창에서만 높이를 맞춘다.
-        const fitContentEditor = () => {
-          const textarea = context.body.querySelector('.simplerp-content-editor');
-          const viewportHeight = window.visualViewport?.height || window.innerHeight;
-          const editorHeight = Math.min(260, Math.floor(viewportHeight * 0.45));
-          textarea.style.height = `${editorHeight}px`;
-          textarea.style.minHeight = `${Math.min(130, editorHeight)}px`;
-          textarea.style.maxHeight = `${Math.floor(viewportHeight * 0.55)}px`;
-        };
-        fitContentEditor();
-        window.visualViewport?.addEventListener('resize', fitContentEditor);
-        context.cleanups.push(() => window.visualViewport?.removeEventListener('resize', fitContentEditor));
+        this.fitContentEditor(context);
       }
     }
     // ── 기기 전용 SIWC 설정: DB 연결·로그인과 공유하지 않는다. ──
@@ -8305,11 +8920,12 @@ button[aria-pressed=true], .simplerp-active {
           return;
         }
         if (button.dataset.roomExport) {
-          const room = await controller.repository.readRoom(button.dataset.roomExport, false);
+          const key = button.dataset.roomExport;
+          const [room, presets] = await Promise.all([controller.repository.readRoom(key, false), controller.loadPresets(key)]);
           if (!room) {
             throw new SimpleRPError('채팅방이 삭제됐습니다.');
           }
-          this.viewer(`${room.meta.name} · JSON`, await JsonWork.run('stringify', portableRoom(room)), 'SimpleRP-room.json', 'application/json;charset=utf-8');
+          this.viewer(`${room.meta.name} · JSON`, await JsonWork.run('stringify', { ...portableRoom(room), presets: await portablePresets(presets) }), 'SimpleRP-room.json', 'application/json;charset=utf-8');
           return;
         }
         const key = button.dataset.roomDelete;
@@ -8332,9 +8948,24 @@ button[aria-pressed=true], .simplerp-active {
           controller.draft = emptyRoom({ ...controller.draft.meta, updatedAt: 0 });
           controller.draftBase = clone(controller.draft);
         }
-        if (controller.identity?.roomKey === key) {
+        if (controller.presetLinksCache) {
+          delete controller.presetLinksCache[key];
+        }
+        controller.roomNamesCache?.delete(key);
+        // 연결 저장 기준만 삭제된 상태로 맞춘다. 공용 프리셋 편집본은 유지한다.
+        const viewing = controller.draft?.meta.roomKey === key;
+        const current = controller.identity?.roomKey === key;
+        if (current) {
           controller.currentRoomCache = null;
           controller.preview = null;
+        }
+        const fresh = viewing || current ? await controller.loadPresets(key) : null;
+        for (const presets of viewing ? [controller.presetDraft, controller.presetBase] : []) {
+          presets.links = clone(fresh.links);
+          presets.etags.links = fresh.etags.links;
+        }
+        if (current) {
+          controller.currentPresets = { ...controller.currentPresets, links: fresh.links, etags: { ...controller.currentPresets.etags, links: fresh.etags.links } };
           controller.auto.enabled = false;
           controller.auto.warning = '';
         }
@@ -8513,16 +9144,17 @@ button[aria-pressed=true], .simplerp-active {
       let context;
       context = this.modal('변경사항', '', [['닫기', () => this.closeModal(context)], ...(readOnly ? [] : [['적용', async () => {
         this.controller.assertEditable();
-        if (!equal(this.controller.draft, review.before)) {
+        if (!equal(this.controller.draft, review.before) || !presetsEqual(this.controller.presetDraft, review.presetsBefore)) {
           throw new SimpleRPError('비교 이후 편집본이 바뀌었습니다. 다시 검사하세요.');
         }
         if (review.staleSource && (await this.confirmStaleSource('JSON 적용 후 저장')) !== 'apply') {
           return;
         }
-        if (!equal(this.controller.draft, review.before)) {
+        if (!equal(this.controller.draft, review.before) || !presetsEqual(this.controller.presetDraft, review.presetsBefore)) {
           throw new SimpleRPError('확인 이후 편집본이 바뀌었습니다. 다시 검사하세요.');
         }
         this.controller.draft = clone(review.after);
+        this.controller.presetDraft.links = clone(review.presetsAfter.links);
         this.controller.edited();
         await this.closeModal(context);
         await closeInput();
@@ -8534,12 +9166,14 @@ button[aria-pressed=true], .simplerp-active {
           dateLogs: '날짜',
           people: '인물',
           lore: '자료집',
-          extras: '기타'
+          extras: '기타',
+          presets: '프리셋'
         }[key])}<small>${review.diff[key].length}</small></button>`).join('')}</div><div class="simplerp-list">${review.diff[active].slice(0, visibleChanges).map((change, index) => `<details class="simplerp-diff-row" data-diff-row="${index}"><summary><span class="simplerp-diff-symbol simplerp-diff-${change.type}">${{
           add: '＋',
           delete: '−',
-          modify: '△'
-        }[change.type]}</span><span class="simplerp-record-title">${html(change.title)}</span><small>${html(this.kindLabel(change.kind))}${change.moved ? ' · 순서 변경' : ''}</small></summary><div class="simplerp-diff-detail"></div></details>`).join('') || '<p class="simplerp-empty">변경 없음</p>'}</div>${review.diff[active].length > visibleChanges ? '<button type="button" data-more-changes>더 보기</button>' : ''}`;
+          modify: '△',
+          fail: '!'
+        }[change.type]}</span><span class="simplerp-record-title">${html(change.title)}</span><small>${change.type === 'fail' ? '연결 실패' : html(this.kindLabel(change.kind))}${change.moved ? ' · 순서 변경' : ''}</small></summary><div class="simplerp-diff-detail"></div></details>`).join('') || '<p class="simplerp-empty">변경 없음</p>'}</div>${review.diff[active].length > visibleChanges ? '<button type="button" data-more-changes>더 보기</button>' : ''}`;
         context.body.querySelector('[data-more-changes]')?.addEventListener('click', () => {
           visibleChanges += 100;
           paint();
@@ -8564,7 +9198,7 @@ button[aria-pressed=true], .simplerp-active {
             void this.run(async () => {
               const markup = await this.renderDiffFields(
                 this.diffFields(change.before, review.before, change.kind),
-                this.diffFields(change.after, review.after, change.kind),
+                change.type === 'fail' ? [{ key: 'reason', label: '원인', value: change.reason }] : this.diffFields(change.after, review.after, change.kind),
                 change.type === 'modify', isActive
               );
               if (isActive()) {
@@ -8617,6 +9251,11 @@ button[aria-pressed=true], .simplerp-active {
           return [
             field('title', '제목', item.title),
             chips('triggers', '감지어', item.triggers), field('body', '내용', item.body)
+          ];
+        case 'presets':
+          return [
+            field('enabled', '사용', item.enabled ? 'ON' : 'OFF', true),
+            field('pinned', '고정', item.pinned ? 'ON' : 'OFF', true)
           ];
         case 'speech':
           return [
@@ -8838,7 +9477,8 @@ button[aria-pressed=true], .simplerp-active {
             schemaVersion: SCHEMA_VERSION,
             exportedAt: Date.now(),
             rooms: snapshot.rooms,
-            settings: snapshot.settings
+            settings: snapshot.settings,
+            presets: snapshot.presets
           };
           this.viewer('전체 백업', await JsonWork.run('stringify', backup), `SimpleRP-backup-v${SCHEMA_VERSION}-${new Date().toISOString().slice(0, 10)}.json`, 'application/json;charset=utf-8');
         }));
@@ -8853,14 +9493,15 @@ button[aria-pressed=true], .simplerp-active {
         this.controller.assertEditable(null);
         const backup = await JsonWork.run('parse', editor.text);
         const validator = new SchemaValidator();
-        validator.object(backup, '$', ['format', 'schemaVersion', 'exportedAt', 'rooms', 'settings']);
+        validator.object(backup, '$', ['format', 'schemaVersion', 'exportedAt', 'rooms', 'settings', 'presets']);
         validator.choice(backup.format, 'format', ['simplerp-backup']);
         validator.choice(backup.schemaVersion, 'schemaVersion', [SCHEMA_VERSION]);
         validator.number(backup.exportedAt, 'exportedAt');
         const snapshot = {
           schemaVersion: SCHEMA_VERSION,
           rooms: backup.rooms,
-          settings: backup.settings
+          settings: backup.settings,
+          presets: backup.presets
         };
         await validator.snapshot(snapshot);
         const repository = this.controller.repository;
@@ -8872,11 +9513,12 @@ button[aria-pressed=true], .simplerp-active {
           }
         };
         const before = await repository.snapshot();
-        const message = `저장소: ${repository.backend === 'firebase' ? 'Firebase' : '로컬'}\n현재 ${Object.keys(before.snapshot.rooms).length}개 채팅방과 커스텀지침·활성 지침 설정은 삭제되고, 백업의 ${Object.keys(snapshot.rooms).length}개 채팅방 및 지침 설정으로 교체됩니다.\n미저장 편집도 폐기됩니다. 별도 백업이 없으면 복구할 수 없습니다. DB 연결 설정은 유지합니다.`;
+        const message = `저장소: ${repository.backend === 'firebase' ? 'Firebase' : '로컬'}\n현재 ${Object.keys(before.snapshot.rooms).length}개 채팅방, 공용 프리셋, 지침 설정은 삭제되고, 백업의 ${Object.keys(snapshot.rooms).length}개 채팅방, 공용 프리셋, 지침 설정으로 교체됩니다.\n미저장 편집도 폐기됩니다. 별도 백업이 없으면 복구할 수 없습니다. DB 연결 설정은 유지합니다.`;
         if ((await this.confirm('전체 데이터 복원', message)) !== 'apply') {
           return;
         }
         const newerThanBackup = before.snapshot.settings.updatedAt > backup.exportedAt ||
+          [before.snapshot.presets.library, ...Object.values(before.snapshot.presets.links)].some(record => record.updatedAt > backup.exportedAt) ||
           Object.values(before.snapshot.rooms).some(room => room.meta.updatedAt > backup.exportedAt);
         if (newerThanBackup && (await this.confirmStaleSource('전체 복원')) !== 'apply') {
           return;
@@ -9180,6 +9822,14 @@ button[aria-pressed=true], .simplerp-active {
             return '전환 후 데이터 확인';
           }
           let settings = snapshot?.settings;
+          let presets = snapshot?.presets?.library?.items || [];
+          if (typeof snapshot?.presets?.library?.data === 'string') {
+            try {
+              presets = JSON.parse(snapshot.presets.library.data);
+            } catch {
+              return `${Object.keys(snapshot?.rooms || {}).length}개 채팅방 · 공용 프리셋 확인 불가`;
+            }
+          }
           if (typeof settings?.data === 'string') {
             try {
               settings = JSON.parse(settings.data);
@@ -9187,11 +9837,11 @@ button[aria-pressed=true], .simplerp-active {
               return `${Object.keys(snapshot?.rooms || {}).length}개 채팅방 · 지침 확인 불가`;
             }
           }
-          return `${Object.keys(snapshot?.rooms || {}).length}개 채팅방 · 커스텀지침 ${Object.values(settings?.customGuides || {}).filter(Boolean).length}개`;
+          return `${Object.keys(snapshot?.rooms || {}).length}개 채팅방 · 공용 프리셋 ${presets.length}개 · 커스텀지침 ${Object.values(settings?.customGuides || {}).filter(Boolean).length}개`;
         };
         const explanation = restrictedSource
           ? '오류 중에는 저장소 간 데이터 이동·덮어쓰기가 불가능합니다. 선택한 저장소의 기존 데이터만 사용하며, 양쪽 데이터는 변경하지 않습니다.'
-          : disconnect ? 'Firebase 원본은 유지됩니다. 기존 로컬을 사용하거나 Firebase 자료를 로컬로 복사할 수 있습니다.' : '두 저장소에 데이터가 있습니다. 병합하지 않고 한쪽을 사용합니다. 반대쪽 기존 채팅방과 지침은 삭제·덮어쓰기됩니다. 별도 백업이 없으면 복구할 수 없습니다.';
+          : disconnect ? 'Firebase 원본은 유지됩니다. 기존 로컬을 사용하거나 Firebase 자료를 로컬로 복사할 수 있습니다.' : '두 저장소에 데이터가 있습니다. 병합하지 않고 한쪽을 사용합니다. 반대쪽 기존 채팅방, 공용 프리셋, 지침은 삭제·덮어쓰기됩니다. 별도 백업이 없으면 복구할 수 없습니다.';
         const context = this.modal(disconnect ? '로컬에서 사용할 데이터' : '사용할 데이터 선택', `<p>${explanation}</p><div class="simplerp-source-choices"><button type="button" data-source="local"><strong>기존 로컬 사용</strong><small>${count(local)}</small><span data-source-result></span></button><button type="button" data-source="firebase"><strong>${disconnect && !restrictedSource ? 'Firebase를 로컬로 가져오기' : 'Firebase 사용'}</strong><small>${count(remote)}</small><span data-source-result></span></button></div><p class="simplerp-conflict-warning" data-replacement-warning></p>`, [['취소', async () => {
           await this.closeModal(context, true);
           resolve(null);
@@ -9216,7 +9866,7 @@ button[aria-pressed=true], .simplerp-active {
             card.querySelector('[data-source-result]').textContent = restrictedSource ? used ? '이 데이터 사용' : '이동 불가 · 원본 유지' : deleted ? '기존 데이터 삭제' : disconnect && !localCard ? '원격 원본 유지' : used ? '이 데이터 사용' : '원본 유지';
           });
           const warning = context.body.querySelector('[data-replacement-warning]');
-          warning.textContent = restrictedSource ? '' : disconnect ? selected === 'firebase' ? '기존 로컬 채팅방·지침은 삭제되고 Firebase 자료로 덮어씁니다. Firebase 원본은 유지됩니다. 적용하면 계속합니다.' : '기존 로컬 데이터와 Firebase 원본 모두 유지합니다. Firebase 연결만 해제합니다.' : `${selected === 'local' ? 'Firebase' : '로컬'}의 기존 채팅방·지침은 삭제되고 ${selected === 'local' ? '로컬' : 'Firebase'} 자료로 덮어씁니다. 적용하면 계속합니다.`;
+          warning.textContent = restrictedSource ? '' : disconnect ? selected === 'firebase' ? '기존 로컬 채팅방·공용 프리셋·지침은 삭제되고 Firebase 자료로 덮어씁니다. Firebase 원본은 유지됩니다. 적용하면 계속합니다.' : '기존 로컬 데이터와 Firebase 원본 모두 유지합니다. Firebase 연결만 해제합니다.' : `${selected === 'local' ? 'Firebase' : '로컬'}의 기존 채팅방·공용 프리셋·지침은 삭제되고 ${selected === 'local' ? '로컬' : 'Firebase'} 자료로 덮어씁니다. 적용하면 계속합니다.`;
         };
         context.body.querySelectorAll('[data-source]').forEach(button => {
           button.disabled = Boolean(restrictedSource && button.dataset.source !== restrictedSource);
@@ -9303,7 +9953,7 @@ button[aria-pressed=true], .simplerp-active {
         return useSelectedStorageOnly();
       }
       assertSource();
-      const localHasData = Object.keys(local.snapshot.rooms).length > 0 || !equal(local.snapshot.settings, emptySettings());
+      const localHasData = Object.keys(local.snapshot.rooms).length > 0 || !equal(local.snapshot.settings, emptySettings()) || local.snapshot.presets.library.items.length > 0;
       let choice = 'firebase';
       if (localHasData && (disconnect || !remote.emptyRoot)) {
         choice = await this.chooseDatabaseSource(local.snapshot, remote.snapshot, disconnect);
@@ -9311,7 +9961,7 @@ button[aria-pressed=true], .simplerp-active {
           return false;
         }
       } else if (!disconnect && localHasData) {
-        if ((await this.confirm('Firebase에 복사', `${Object.keys(local.snapshot.rooms).length}개 로컬 채팅방과 지침을 빈 Firebase 저장소에 복사합니다.`, [['cancel', '취소'], ['apply', '복사 후 연결']])) !== 'apply') {
+        if ((await this.confirm('Firebase에 복사', `${Object.keys(local.snapshot.rooms).length}개 로컬 채팅방, 공용 프리셋, 지침을 빈 Firebase 저장소에 복사합니다.`, [['cancel', '취소'], ['apply', '복사 후 연결']])) !== 'apply') {
           return false;
         }
         choice = 'local';
@@ -9365,13 +10015,39 @@ button[aria-pressed=true], .simplerp-active {
           <dt>지원 데이터 버전</dt><dd>${SCHEMA_VERSION}</dd>
         </dl>
         <pre class="simplerp-error-diagnostic" data-storage-diagnostic>${html(diagnostic)}</pre>
-        ${newer ? '<a href="https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js" target="_blank" rel="noopener noreferrer">SimpleRP 업데이트</a>' : ''}
-        ${recovery ? `<p>${newer ? '이 버전에서는 복원·초기화할 수 없습니다.' : '초기화가 필요할 수 있습니다. 먼저 원본 백업을 저장하세요.'}</p>
+        ${newer && this.update ? textButton('update', 'SimpleRP 업데이트') : ''}
+        ${recovery ? `<p>${newer ? '업데이트하면 데이터를 그대로 사용할 수 있습니다. 이 버전으로 되돌리려면 초기화한 뒤 이 버전의 전체 백업을 복원하세요.' : '초기화가 필요할 수 있습니다. 먼저 원본 백업을 저장하세요.'}</p>
         <p>원본 백업은 오류가 있는 데이터를 그대로 보관하는 파일입니다. 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.</p>
         <div class="simplerp-actions">
           ${textButton('storage-backup', '원본 백업', '', this.storageRecoveryBusy ? 'disabled' : '')}
-          ${!newer ? `<button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>` : ''}
+          <button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>
         </div>` : ''}`;
+    }
+    // 업데이트 확인 실패는 기존 기능에 영향을 주지 않는다.
+    async checkUpdate() {
+      const installed = GM_info.script.version;
+      const response = await privilegedHttp({ method: 'GET', service: '업데이트 정보', url: VERSION_INFO_URL });
+      const versions = JSON.parse(response.text).versions
+        .filter(row => /^\d+(\.\d+)*$/.test(row.version) && compareVersions(row.version, installed) > 0)
+        .sort((left, right) => compareVersions(right.version, left.version));
+      if (versions.length && versions[0].downloadURL.startsWith('https://')) {
+        this.update = { installed, versions };
+        this.render();
+      }
+    }
+    openUpdate() {
+      const { installed, versions } = this.update;
+      let context;
+      context = this.modal('업데이트', `<dl class="simplerp-error-versions">
+          <dt>설치된 버전</dt><dd>${html(installed)}</dd>
+          <dt>최신 버전</dt><dd>${html(versions[0].version)}</dd>
+        </dl>
+        <section class="simplerp-help-section"><h4>업데이트 방법</h4><ol>
+          <li>(권장) 설정에서 전체 백업</li>
+          <li>같은 DB를 사용하는 모든 기기에서 업데이트</li>
+          <li>실행하면 데이터가 자동으로 변경됨</li>
+        </ol><a class="simplerp-btn simplerp-primary" href="${html(versions[0].downloadURL)}" target="_blank" rel="noopener noreferrer">${icon('download')}다운로드</a></section>
+        <section class="simplerp-help-section"><h4>패치 내역</h4>${versions.map(row => `<strong>${html(row.version)}</strong><ul>${row.changes.map(change => `<li>${html(change)}</li>`).join('')}</ul>`).join('')}</section>`, [['닫기', () => this.closeModal(context)]]);
     }
     async openErrorDetails(anchor, message) {
       this.helpPopover?.remove();
@@ -9436,12 +10112,15 @@ button[aria-pressed=true], .simplerp-active {
       const originalRepository = controller.repository;
       const activeTarget = repository === originalRepository;
       const before = repository.backend === 'firebase' ? await repository.readRawStorage() : null;
+      const version = await repository.readRecoveryVersion();
+      const newer = version.schemaVersion > SCHEMA_VERSION || version.databaseVersion > SCHEMA_VERSION;
       const target = repository.backend === 'firebase'
         ? `Firebase · ${repository.identity.config.projectId}\n경로: ${before.target}`
         : `로컬 · ${DATABASE_NAME}`;
       this.helpPopover?.hidePopover();
-      const warning = `대상: ${target}\n이 저장소의 모든 채팅방 데이터와 지침 설정을 삭제합니다. 삭제한 데이터는 되돌릴 수 없습니다.\n원본 백업은 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.\n${issue.backupRequested ? '원본 백업 파일이 실제로 저장됐는지 확인하세요.' : '먼저 취소하여 원본 백업 파일을 저장하는 것을 권장합니다.'}\n${activeTarget ? '미저장 편집본도 모두 폐기됩니다.\n' : ''}\n정말 초기화할까요?`;
-      const confirmation = this.confirm('데이터 삭제 · 초기화', warning, [['cancel', '취소'], ['apply', '전체 삭제 · 초기화']]);
+      const newerWarning = newer ? `저장된 데이터(v${storageVersionLabel(version.schemaVersion ?? version.databaseVersion)})가 이 확프(v${SCHEMA_VERSION})보다 최신이며, 손상된 데이터가 아닙니다.\nSimpleRP를 업데이트하면 초기화 없이 그대로 사용할 수 있습니다.\n${repository.backend === 'firebase' ? '같은 DB를 사용하는 모든 기기의 데이터가 함께 삭제됩니다.\n' : ''}v${SCHEMA_VERSION} 전체 백업이 없으면 초기화 후 복구할 수 없습니다.\n\n` : '';
+      const warning = `${newerWarning}대상: ${target}\n이 저장소의 모든 채팅방 데이터, 공용 프리셋, 지침 설정을 삭제합니다. 삭제한 데이터는 되돌릴 수 없습니다.\n원본 백업은 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.\n${issue.backupRequested ? '원본 백업 파일이 실제로 저장됐는지 확인하세요.' : '먼저 취소하여 원본 백업 파일을 저장하는 것을 권장합니다.'}\n${activeTarget ? '미저장 편집본도 모두 폐기됩니다.\n' : ''}\n정말 초기화할까요?`;
+      const confirmation = this.confirm(newer ? '최신 데이터 삭제 · 초기화' : '데이터 삭제 · 초기화', warning, [['cancel', '취소'], ['apply', '전체 삭제 · 초기화']]);
       this.modalStack.at(-1).footer.lastElementChild.classList.add('simplerp-danger');
       if (await confirmation !== 'apply') {
         return;
@@ -9463,11 +10142,11 @@ button[aria-pressed=true], .simplerp-active {
           controller.paint();
         }
         if (repository.backend === 'firebase') {
-          await repository.resetRawStorage(before);
+          await repository.resetRawStorage(before, newer);
         } else {
           await repository.resetRawStorage(() => {
             this.showNotice('초기화 대기 중입니다. 다른 Crack 탭을 닫아 주세요.');
-          });
+          }, newer);
         }
         if (this.storageIssue?.repository === repository) {
           this.storageIssue = null;
@@ -9527,6 +10206,11 @@ button[aria-pressed=true], .simplerp-active {
           ['기타', [['관리방식', 'AI 구축이 아닌 사용자 지정 주입 정보']]],
           ['자동주입', [['검색범위', '최근 10턴'], ['관련기준', '감지어 일치만으로 선택']]],
           ['항목설정', [['제외', '설정을 해제하면 자동주입 후보에서 제거'], ['고정', '자동주입과 무관하게 항상 주입'], ['초과', '용량 초과시 주입 해제']]]
+        ],
+        presets: [
+          ['공용 프리셋', [['용도', '여러 채팅방에서 함께 쓰는 기타 항목'], ['수정', '저장하면 연결한 모든 채팅방에 적용'], ['연결', '사슬 버튼으로 이 채팅방에서 사용']]],
+          ['방별설정', [['사용·고정', '이 채팅방 탭에서 채팅방마다 따로 설정']]],
+          ['주의', [['초과', '내용이 길어지면 연결한 다른 채팅방의 주입이 용량 초과로 해제될 수 있음']]]
         ],
       }[kind] || [];
       this.helpPopover?.remove();
@@ -9740,6 +10424,7 @@ button[aria-pressed=true], .simplerp-active {
       }
     };
     ui.onRouteMismatch = checkRoute;
+    void ui.checkUpdate().catch(() => {});
     let domTimer;
     let observedRouteUrl = location.href;
     const observer = new MutationObserver(mutations => {

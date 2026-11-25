@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      2.0.0.1
+// @version      2.0.1.0
 // @description  Crack 채팅의 기억을 정리하고 주입해 이야기의 연속성을 유지합니다. 로컬·Firebase 저장과 AI 기억 구축을 지원합니다. (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -15,8 +15,7 @@
 // @connect      auth.openai.com
 // @connect      api.openai.com
 // @connect      raw.githubusercontent.com
-// @updateURL    https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js
-// @downloadURL  https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js
+// @downloadURL  none
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23ffffff'%3E%3Cpath d='M3.2 18.9c2.4-.7 3.8-2.2 4.6-4.5.9-2.7 1.8-5.2 4.2-7.2 2.4-2 5.2-3.2 8.8-3.4-.4 1.9-1.2 3.8-2.4 5.2-1.1 1.3-2.5 2.2-4.1 2.8 1.7-.1 3.1-.5 4.3-1.1-.6 1.8-1.7 3.4-3.2 4.4-1.1.8-2.4 1.3-3.8 1.5 1.3.2 2.5.1 3.6-.2-.9 1.4-2.2 2.5-3.8 3.1-1.3.5-2.7.7-4.1.5 1 .5 2 .8 3.1.9-1.7.9-3.7 1.1-5.6.5-1-.3-1.6-1.2-1.6-2.5z'/%3E%3Cpath d='M8.2 16.8c1.9-.8 3.5-2 4.8-3.6-1.1 2.2-2.7 4-4.9 5.2-.6.3-1.2.5-1.8.7.7-.6 1.3-1.4 1.9-2.3z' fill='%23000000' fill-opacity='.22'/%3E%3Cpath d='M10.8 13.4c1.8-.7 3.4-1.8 4.8-3.2-1.2 2-2.8 3.5-4.9 4.5-.5.2-1 .4-1.5.5.6-.5 1.1-1.1 1.6-1.8z' fill='%23000000' fill-opacity='.22'/%3E%3C/svg%3E
 // ==/UserScript==
 
@@ -111,6 +110,7 @@
   const KNOWLEDGE_STATES = ['알고 있음', '모름', '추측', '오해', '미확인'];
   const GUIDES = ['full', 'continue', 'compress'];
   const SIWC_KEY = 'simplerp-siwc';
+  const VERSION_INFO_URL = 'https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/version.json';
   const MIGRATION_BASE_URL = 'https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/src/migrations/';
   const MIGRATIONS = { 1: { file: 'schema-v2.js', hash: 'c5deb4513409882dd0cd5fce2ebc197ee37b0eaf179217cda8521009e2b59df1' } };
   const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
@@ -233,6 +233,18 @@
       return '잘못된 버전 값';
     }
     return String(value).slice(0, 80);
+  }
+  // 자리마다 숫자로 비교한다. 1.19.0은 1.9.0보다 최신이다.
+  function compareVersions(left, right) {
+    const first = left.split('.').map(Number);
+    const second = right.split('.').map(Number);
+    for (let index = 0; index < Math.max(first.length, second.length); index += 1) {
+      const difference = (first[index] || 0) - (second[index] || 0);
+      if (difference) {
+        return difference;
+      }
+    }
+    return 0;
   }
   async function sha256(value) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
@@ -2319,10 +2331,10 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         database.close();
       }
     }
-    async resetRawStorage(onBlocked) {
+    async resetRawStorage(onBlocked, allowNewer = false) {
       const version = await this.readRecoveryVersion();
-      if (version.schemaVersion > SCHEMA_VERSION || version.databaseVersion > SCHEMA_VERSION) {
-        throw new SimpleRPError('더 최신 데이터는 초기화할 수 없습니다. SimpleRP를 업데이트하세요.');
+      if (!allowNewer && (version.schemaVersion > SCHEMA_VERSION || version.databaseVersion > SCHEMA_VERSION)) {
+        throw new SimpleRPError('확인 중 더 최신 구조의 데이터로 변경됐습니다. 다시 확인하세요.');
       }
       if (this.resetting) {
         throw new SimpleRPError('이미 로컬 초기화 중입니다.');
@@ -2968,7 +2980,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       return { schemaVersion };
     }
-    async resetRawStorage(before) {
+    async resetRawStorage(before, allowNewer = false) {
       if (this.resetting) {
         throw new SimpleRPError('이미 Firebase 초기화 중입니다.');
       }
@@ -2978,9 +2990,9 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       // 실제 삭제 요청은 서버 권한과 확인 직전 원본의 ETag를 사용한다.
       this.resetting = true;
       const stored = JSON.parse(before.rawJSON);
-      if (stored?.schemaVersion > SCHEMA_VERSION) {
+      if (!allowNewer && stored?.schemaVersion > SCHEMA_VERSION) {
         this.resetting = false;
-        throw new SimpleRPError('더 최신 데이터는 이 버전에서 초기화할 수 없습니다. 확프를 업데이트하세요.');
+        throw new SimpleRPError('확인 중 더 최신 구조의 데이터로 변경됐습니다. 다시 확인하세요.');
       }
       try {
         try {
@@ -5568,6 +5580,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     "key": "<circle cx=\"8\" cy=\"8\" r=\"5\"/><path d=\"m12 12 9 9m-3-3 3-3m-6 0 3-3\"/>",
     "diff": "<path d=\"M8 3v18m-4-4 4 4 4-4M16 21V3m-4 4 4-4 4 4\"/>",
     "undo": "<path d=\"M3 10a9 9 0 1 1 2.7 8M3 4v6h6\"/>",
+    "update": "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 17V7m-4 4 4-4 4 4\"/>",
     "help": "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M9 8a3 3 0 0 1 6 1c0 2-3 2-3 4m0 3h.01\"/>",
     "flame": "<path d=\"M12 2c1 5 6 6 6 11a6 6 0 0 1-12 0c0-3 2-5 3-7 0 3 1 4 2 4 2-2 2-5 1-8Z\"/><path d=\"M12 12c-2 2-3 3-3 5a3 3 0 0 0 6 0c0-2-2-3-3-5Z\"/>"
   };
@@ -7109,6 +7122,7 @@ button[aria-pressed=true], .simplerp-active {
       const issue = controller.injection.error || this.persistentError || this.storageIssue || controller.auto.warning;
       const autoWarningOnly = controller.auto.warning && !controller.injection.error && !this.persistentError && !this.storageIssue;
       const actions = [
+        this.update ? iconButton('update', '업데이트', 'update', 'style="color:#8fd0a8"') : '',
         issue ? `<button type="button" class="simplerp-icon-btn ${autoWarningOnly ? 'simplerp-auto-warning' : 'simplerp-alert'}" data-action="error-details" aria-label="오류 상세">!</button>` : '',
         iconButton('rooms', '전체 데이터 목록', 'list', room ? '' : 'disabled'),
         iconButton('api-settings', '자동구축 API 설정', 'gpt', controller.api.settings ? 'style="color:#b5a0df"' : ''),
@@ -7388,6 +7402,9 @@ button[aria-pressed=true], .simplerp-active {
           return controller.auto.job ? this.stopAutoBuild() : this.openAutoRun();
         case 'error-details':
           return this.openErrorDetails(button);
+        case 'update':
+          this.helpPopover?.remove();
+          return this.openUpdate();
         case 'storage-backup':
         case 'storage-reset': {
           const issue = this.storageIssue;
@@ -9365,13 +9382,39 @@ button[aria-pressed=true], .simplerp-active {
           <dt>지원 데이터 버전</dt><dd>${SCHEMA_VERSION}</dd>
         </dl>
         <pre class="simplerp-error-diagnostic" data-storage-diagnostic>${html(diagnostic)}</pre>
-        ${newer ? '<a href="https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js" target="_blank" rel="noopener noreferrer">SimpleRP 업데이트</a>' : ''}
-        ${recovery ? `<p>${newer ? '이 버전에서는 복원·초기화할 수 없습니다.' : '초기화가 필요할 수 있습니다. 먼저 원본 백업을 저장하세요.'}</p>
+        ${newer && this.update ? textButton('update', 'SimpleRP 업데이트') : ''}
+        ${recovery ? `<p>${newer ? '업데이트하면 데이터를 그대로 사용할 수 있습니다. 이 버전으로 되돌리려면 초기화한 뒤 이 버전의 전체 백업을 복원하세요.' : '초기화가 필요할 수 있습니다. 먼저 원본 백업을 저장하세요.'}</p>
         <p>원본 백업은 오류가 있는 데이터를 그대로 보관하는 파일입니다. 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.</p>
         <div class="simplerp-actions">
           ${textButton('storage-backup', '원본 백업', '', this.storageRecoveryBusy ? 'disabled' : '')}
-          ${!newer ? `<button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>` : ''}
+          <button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>
         </div>` : ''}`;
+    }
+    // 업데이트 확인 실패는 기존 기능에 영향을 주지 않는다.
+    async checkUpdate() {
+      const installed = GM_info.script.version;
+      const response = await privilegedHttp({ method: 'GET', service: '업데이트 정보', url: VERSION_INFO_URL });
+      const versions = JSON.parse(response.text).versions
+        .filter(row => /^\d+(\.\d+)*$/.test(row.version) && compareVersions(row.version, installed) > 0)
+        .sort((left, right) => compareVersions(right.version, left.version));
+      if (versions.length && versions[0].downloadURL.startsWith('https://')) {
+        this.update = { installed, versions };
+        this.render();
+      }
+    }
+    openUpdate() {
+      const { installed, versions } = this.update;
+      let context;
+      context = this.modal('업데이트', `<dl class="simplerp-error-versions">
+          <dt>설치된 버전</dt><dd>${html(installed)}</dd>
+          <dt>최신 버전</dt><dd>${html(versions[0].version)}</dd>
+        </dl>
+        <section class="simplerp-help-section"><h4>업데이트 방법</h4><ol>
+          <li>(권장) 설정에서 전체 백업</li>
+          <li>같은 DB를 사용하는 모든 기기에서 업데이트</li>
+          <li>실행하면 데이터가 자동으로 변경됨</li>
+        </ol><a class="simplerp-btn simplerp-primary" href="${html(versions[0].downloadURL)}" target="_blank" rel="noopener noreferrer">${icon('download')}다운로드</a></section>
+        <section class="simplerp-help-section"><h4>패치 내역</h4>${versions.map(row => `<strong>${html(row.version)}</strong><ul>${row.changes.map(change => `<li>${html(change)}</li>`).join('')}</ul>`).join('')}</section>`, [['닫기', () => this.closeModal(context)]]);
     }
     async openErrorDetails(anchor, message) {
       this.helpPopover?.remove();
@@ -9436,12 +9479,15 @@ button[aria-pressed=true], .simplerp-active {
       const originalRepository = controller.repository;
       const activeTarget = repository === originalRepository;
       const before = repository.backend === 'firebase' ? await repository.readRawStorage() : null;
+      const version = await repository.readRecoveryVersion();
+      const newer = version.schemaVersion > SCHEMA_VERSION || version.databaseVersion > SCHEMA_VERSION;
       const target = repository.backend === 'firebase'
         ? `Firebase · ${repository.identity.config.projectId}\n경로: ${before.target}`
         : `로컬 · ${DATABASE_NAME}`;
       this.helpPopover?.hidePopover();
-      const warning = `대상: ${target}\n이 저장소의 모든 채팅방 데이터와 지침 설정을 삭제합니다. 삭제한 데이터는 되돌릴 수 없습니다.\n원본 백업은 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.\n${issue.backupRequested ? '원본 백업 파일이 실제로 저장됐는지 확인하세요.' : '먼저 취소하여 원본 백업 파일을 저장하는 것을 권장합니다.'}\n${activeTarget ? '미저장 편집본도 모두 폐기됩니다.\n' : ''}\n정말 초기화할까요?`;
-      const confirmation = this.confirm('데이터 삭제 · 초기화', warning, [['cancel', '취소'], ['apply', '전체 삭제 · 초기화']]);
+      const newerWarning = newer ? `저장된 데이터(v${storageVersionLabel(version.schemaVersion ?? version.databaseVersion)})가 이 확프(v${SCHEMA_VERSION})보다 최신이며, 손상된 데이터가 아닙니다.\nSimpleRP를 업데이트하면 초기화 없이 그대로 사용할 수 있습니다.\n${repository.backend === 'firebase' ? '같은 DB를 사용하는 모든 기기의 데이터가 함께 삭제됩니다.\n' : ''}v${SCHEMA_VERSION} 전체 백업이 없으면 초기화 후 복구할 수 없습니다.\n\n` : '';
+      const warning = `${newerWarning}대상: ${target}\n이 저장소의 모든 채팅방 데이터와 지침 설정을 삭제합니다. 삭제한 데이터는 되돌릴 수 없습니다.\n원본 백업은 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.\n${issue.backupRequested ? '원본 백업 파일이 실제로 저장됐는지 확인하세요.' : '먼저 취소하여 원본 백업 파일을 저장하는 것을 권장합니다.'}\n${activeTarget ? '미저장 편집본도 모두 폐기됩니다.\n' : ''}\n정말 초기화할까요?`;
+      const confirmation = this.confirm(newer ? '최신 데이터 삭제 · 초기화' : '데이터 삭제 · 초기화', warning, [['cancel', '취소'], ['apply', '전체 삭제 · 초기화']]);
       this.modalStack.at(-1).footer.lastElementChild.classList.add('simplerp-danger');
       if (await confirmation !== 'apply') {
         return;
@@ -9463,11 +9509,11 @@ button[aria-pressed=true], .simplerp-active {
           controller.paint();
         }
         if (repository.backend === 'firebase') {
-          await repository.resetRawStorage(before);
+          await repository.resetRawStorage(before, newer);
         } else {
           await repository.resetRawStorage(() => {
             this.showNotice('초기화 대기 중입니다. 다른 Crack 탭을 닫아 주세요.');
-          });
+          }, newer);
         }
         if (this.storageIssue?.repository === repository) {
           this.storageIssue = null;
@@ -9740,6 +9786,7 @@ button[aria-pressed=true], .simplerp-active {
       }
     };
     ui.onRouteMismatch = checkRoute;
+    void ui.checkUpdate().catch(() => {});
     let domTimer;
     let observedRouteUrl = location.href;
     const observer = new MutationObserver(mutations => {

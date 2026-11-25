@@ -1,0 +1,21 @@
+{
+  "versions": [
+    {
+      "version": "3.0.0.0",
+      "downloadURL": "https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js",
+      "changes": [
+        "기타에 공용 프리셋 추가 (여러 채팅방에서 함께 사용)",
+        "채팅방 JSON에 공용 프리셋 연결 정보 포함",
+        "데이터구조 v3 적용"
+      ]
+    },
+    {
+      "version": "2.0.1.0",
+      "downloadURL": "https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js",
+      "changes": [
+        "업데이트 안내 방식 변경 (Tampermonkey 자동 업데이트 중단)",
+        "최신 구조의 데이터도 확인 후 초기화할 수 있도록 변경"
+      ]
+    }
+  ]
+}
