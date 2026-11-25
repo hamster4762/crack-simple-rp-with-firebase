@@ -2130,7 +2130,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     }
     assertWritable() {
       if (this.closedForUpgrade) {
-        throw new SimpleRPError('다른 탭에서 데이터구조를 변경했습니다. 편집본을 보관하고 확프를 업데이트한 뒤 새로고침하세요.');
+        throw new SimpleRPError('다른 탭에서 데이터구조를 변경했습니다. 편집본을 보관하고 SimpleRP를 업데이트한 뒤 새로고침하세요.');
       }
       if (this.resetting) {
         throw new SimpleRPError('로컬 초기화 중에는 저장할 수 없습니다.');
@@ -3005,7 +3005,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
               return;
             }
           }
-          throw storageDataError(this, new SimpleRPError('저장소 버전이 다릅니다. 더 최신 구조이면 확프를 업데이트한 뒤 새로고침하세요.'), 'simpleRP/schemaVersion', version);
+          throw storageDataError(this, new SimpleRPError('저장소 버전이 다릅니다. 더 최신 구조이면 SimpleRP를 업데이트한 뒤 새로고침하세요.'), 'simpleRP/schemaVersion', version);
         })().catch(error => {
           this.readyPromise = null;
           throw error;
@@ -10017,7 +10017,7 @@ button[aria-pressed=true], .simplerp-active {
         <pre class="simplerp-error-diagnostic" data-storage-diagnostic>${html(diagnostic)}</pre>
         ${newer && this.update ? textButton('update', 'SimpleRP 업데이트') : ''}
         ${recovery ? `<p>${newer ? '업데이트하면 데이터를 그대로 사용할 수 있습니다. 이 버전으로 되돌리려면 초기화한 뒤 이 버전의 전체 백업을 복원하세요.' : '초기화가 필요할 수 있습니다. 먼저 원본 백업을 저장하세요.'}</p>
-        <p>원본 백업은 오류가 있는 데이터를 그대로 보관하는 파일입니다. 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.</p>
+        <p>원본 백업은 오류가 있는 데이터를 그대로 보관하는 파일입니다. 문제 확인용이며, SimpleRP의 ‘전체 복원’으로 불러올 수 없습니다.</p>
         <div class="simplerp-actions">
           ${textButton('storage-backup', '원본 백업', '', this.storageRecoveryBusy ? 'disabled' : '')}
           <button type="button" class="simplerp-btn simplerp-danger" data-action="storage-reset" ${this.storageRecoveryBusy ? 'disabled' : ''}>초기화</button>
@@ -10118,8 +10118,8 @@ button[aria-pressed=true], .simplerp-active {
         ? `Firebase · ${repository.identity.config.projectId}\n경로: ${before.target}`
         : `로컬 · ${DATABASE_NAME}`;
       this.helpPopover?.hidePopover();
-      const newerWarning = newer ? `저장된 데이터(v${storageVersionLabel(version.schemaVersion ?? version.databaseVersion)})가 이 확프(v${SCHEMA_VERSION})보다 최신이며, 손상된 데이터가 아닙니다.\nSimpleRP를 업데이트하면 초기화 없이 그대로 사용할 수 있습니다.\n${repository.backend === 'firebase' ? '같은 DB를 사용하는 모든 기기의 데이터가 함께 삭제됩니다.\n' : ''}v${SCHEMA_VERSION} 전체 백업이 없으면 초기화 후 복구할 수 없습니다.\n\n` : '';
-      const warning = `${newerWarning}대상: ${target}\n이 저장소의 모든 채팅방 데이터, 공용 프리셋, 지침 설정을 삭제합니다. 삭제한 데이터는 되돌릴 수 없습니다.\n원본 백업은 문제 확인용이며, 확프의 ‘전체 복원’으로 불러올 수 없습니다.\n${issue.backupRequested ? '원본 백업 파일이 실제로 저장됐는지 확인하세요.' : '먼저 취소하여 원본 백업 파일을 저장하는 것을 권장합니다.'}\n${activeTarget ? '미저장 편집본도 모두 폐기됩니다.\n' : ''}\n정말 초기화할까요?`;
+      const newerWarning = newer ? `저장된 데이터(v${storageVersionLabel(version.schemaVersion ?? version.databaseVersion)})가 설치된 SimpleRP(v${SCHEMA_VERSION})보다 최신이며, 손상된 데이터가 아닙니다.\nSimpleRP를 업데이트하면 초기화 없이 그대로 사용할 수 있습니다.\n${repository.backend === 'firebase' ? '같은 DB를 사용하는 모든 기기의 데이터가 함께 삭제됩니다.\n' : ''}v${SCHEMA_VERSION} 전체 백업이 없으면 초기화 후 복구할 수 없습니다.\n\n` : '';
+      const warning = `${newerWarning}대상: ${target}\n이 저장소의 모든 채팅방 데이터, 공용 프리셋, 지침 설정을 삭제합니다. 삭제한 데이터는 되돌릴 수 없습니다.\n원본 백업은 문제 확인용이며, SimpleRP의 ‘전체 복원’으로 불러올 수 없습니다.\n${issue.backupRequested ? '원본 백업 파일이 실제로 저장됐는지 확인하세요.' : '먼저 취소하여 원본 백업 파일을 저장하는 것을 권장합니다.'}\n${activeTarget ? '미저장 편집본도 모두 폐기됩니다.\n' : ''}\n정말 초기화할까요?`;
       const confirmation = this.confirm(newer ? '최신 데이터 삭제 · 초기화' : '데이터 삭제 · 초기화', warning, [['cancel', '취소'], ['apply', '전체 삭제 · 초기화']]);
       this.modalStack.at(-1).footer.lastElementChild.classList.add('simplerp-danger');
       if (await confirmation !== 'apply') {
