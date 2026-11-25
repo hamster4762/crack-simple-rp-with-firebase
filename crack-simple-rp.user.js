@@ -15,6 +15,7 @@
 // @connect      auth.openai.com
 // @connect      api.openai.com
 // @connect      raw.githubusercontent.com
+// @updateURL    none
 // @downloadURL  none
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23ffffff'%3E%3Cpath d='M3.2 18.9c2.4-.7 3.8-2.2 4.6-4.5.9-2.7 1.8-5.2 4.2-7.2 2.4-2 5.2-3.2 8.8-3.4-.4 1.9-1.2 3.8-2.4 5.2-1.1 1.3-2.5 2.2-4.1 2.8 1.7-.1 3.1-.5 4.3-1.1-.6 1.8-1.7 3.4-3.2 4.4-1.1.8-2.4 1.3-3.8 1.5 1.3.2 2.5.1 3.6-.2-.9 1.4-2.2 2.5-3.8 3.1-1.3.5-2.7.7-4.1.5 1 .5 2 .8 3.1.9-1.7.9-3.7 1.1-5.6.5-1-.3-1.6-1.2-1.6-2.5z'/%3E%3Cpath d='M8.2 16.8c1.9-.8 3.5-2 4.8-3.6-1.1 2.2-2.7 4-4.9 5.2-.6.3-1.2.5-1.8.7.7-.6 1.3-1.4 1.9-2.3z' fill='%23000000' fill-opacity='.22'/%3E%3Cpath d='M10.8 13.4c1.8-.7 3.4-1.8 4.8-3.2-1.2 2-2.8 3.5-4.9 4.5-.5.2-1 .4-1.5.5.6-.5 1.1-1.1 1.6-1.8z' fill='%23000000' fill-opacity='.22'/%3E%3C/svg%3E
 // ==/UserScript==
@@ -7284,6 +7285,10 @@ button[aria-pressed=true], .simplerp-active {
                 .simplerp-history-bar > button { margin-left:auto; flex-shrink:0; font-size:10px; padding:4px 6px; }
                 .simplerp-history-bar > .simplerp-actions { margin-left:auto; }
                 .simplerp-record summary > .simplerp-icon { width:14px; height:14px; flex-shrink:0; color:var(--simplerp-accent); }
+                .simplerp-record-heading { flex:1; min-width:0; }
+                .simplerp-record-heading > * { display:block; line-height:1.35; }
+                .simplerp-record-triggers { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9px; color:var(--simplerp-muted); }
+                .simplerp-record-meta .simplerp-icon { width:11px; height:11px; vertical-align:-1px; }
                 .simplerp-preset-rooms summary { cursor:pointer; font-size:12px; }
                 .simplerp-preset-rooms summary small { color:var(--simplerp-muted); }
                 .simplerp-preset-rooms ul { margin:6px 0 0; padding-left:20px; max-height:160px; overflow:auto; font-size:12px; }
@@ -7720,6 +7725,10 @@ button[aria-pressed=true], .simplerp-active {
       const attributes = `data-id="${html(item.id)}" data-kind="${kind}"`;
       return switchButton('item-enabled', `${this.kindLabel(kind)} 사용`, policy.enabled, `${attributes} ${policy.pinned ? 'disabled' : ''}`, policy.pinned) + (pin ? iconButton('item-pinned', '고정', 'pin', `${attributes} aria-pressed="${policy.pinned}" style="color:${policy.pinned ? '#efd3a3' : '#98a6bd'}"`) : '') + iconButton('item-edit', shared ? '공용 프리셋 탭에서 편집' : '편집', 'edit', `${attributes} ${shared ? 'disabled' : ''}`);
     }
+    recordHeading(title, triggers) {
+      const heading = `<span class="simplerp-record-title">${html(title)}</span>`;
+      return triggers.length ? `<span class="simplerp-record-heading">${heading}<small class="simplerp-record-triggers">${html(triggers.join(' · '))}</small></span>` : heading;
+    }
     record(item, kind, title = null, controls = true, pin = true) {
       const room = this.controller.draft;
       const key = item.id || `state-${item.key}`;
@@ -7727,7 +7736,7 @@ button[aria-pressed=true], .simplerp-active {
       this.recordData.set(key, { item, kind, body });
       const excluded = this.controller.showingCurrentRoom && this.controller.preview?.excluded.some(row => row.id === item.id);
       const typeChip = kind === 'lore' ? `<span class="simplerp-tag simplerp-tag-lore">${html(item.type)}</span>` : kind === 'presets' ? icon('link') : '';
-      return `<details class="simplerp-record" data-record="${html(key)}"><summary>${typeChip}<span class="simplerp-record-title">${html(title || itemTitle(room, item, kind))}</span><small class="simplerp-record-meta">${displayCount(body.length)}자</small>${excluded ? '<small class="simplerp-record-meta">용량 후보</small>' : ''}${controls ? this.rowControls(item, kind, pin) : iconButton('state-edit', '편집', 'edit', `data-state-key="${html(item.key)}"`)}</summary><div class="simplerp-record-body" data-record-body></div></details>`;
+      return `<details class="simplerp-record" data-record="${html(key)}"><summary>${typeChip}${this.recordHeading(title || itemTitle(room, item, kind), kind === 'extras' || kind === 'presets' ? item.triggers : [])}<small class="simplerp-record-meta">${displayCount(body.length)}자</small>${excluded ? '<small class="simplerp-record-meta">용량 후보</small>' : ''}${controls ? this.rowControls(item, kind, pin) : iconButton('state-edit', '편집', 'edit', `data-state-key="${html(item.key)}"`)}</summary><div class="simplerp-record-body" data-record-body></div></details>`;
     }
     mountRecord(details) {
       const body = details.querySelector('[data-record-body]');
@@ -7822,7 +7831,7 @@ button[aria-pressed=true], .simplerp-active {
       const body = itemBody(this.controller.draft, item, 'presets');
       const attributes = `data-id="${html(item.id)}"`;
       this.recordData.set(item.id, { item, kind: 'presets', body });
-      return `<details class="simplerp-record simplerp-preset" data-record="${html(item.id)}"><summary><span class="simplerp-record-title">${html(item.title)}</span><small class="simplerp-record-meta">${this.controller.presetRooms(item.id)?.length ?? '…'}개 방</small><small class="simplerp-record-meta">${displayCount(body.length)}자</small>${iconButton('preset-up', '위로', 'up', `${attributes} ${index ? '' : 'disabled'}`)}${iconButton('preset-down', '아래로', 'down', `${attributes} ${index + 1 < presets.library.items.length ? '' : 'disabled'}`)}${iconButton('preset-link', linked ? '이 채팅방 연결 해제' : '이 채팅방에 연결', 'link', `${attributes} aria-pressed="${linked}" style="color:${linked ? '#efd3a3' : '#98a6bd'}"`)}${iconButton('preset-edit', '편집', 'edit', attributes)}</summary><div class="simplerp-record-body" data-record-body></div></details>`;
+      return `<details class="simplerp-record simplerp-preset" data-record="${html(item.id)}"><summary>${this.recordHeading(item.title, item.triggers)}<small class="simplerp-record-meta" title="사용 중인 채팅방 · 글자수">${icon('link')} ${this.controller.presetRooms(item.id)?.length ?? '…'} · ${displayCount(body.length)}자</small>${iconButton('preset-up', '위로', 'up', `${attributes} ${index ? '' : 'disabled'}`)}${iconButton('preset-down', '아래로', 'down', `${attributes} ${index + 1 < presets.library.items.length ? '' : 'disabled'}`)}${iconButton('preset-link', linked ? '이 채팅방 연결 해제' : '이 채팅방에 연결', 'link', `${attributes} aria-pressed="${linked}" style="color:${linked ? '#efd3a3' : '#98a6bd'}"`)}${iconButton('preset-edit', '편집', 'edit', attributes)}</summary><div class="simplerp-record-body" data-record-body></div></details>`;
     }
     async loadPresetUsage() {
       if (!this.controller.presetLinksCache) {
