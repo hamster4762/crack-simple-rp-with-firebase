@@ -1,0 +1,19 @@
+{
+  "versions": [
+    {
+      "version": "3.0.0.0",
+      "downloadURL": "https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js",
+      "changes": [
+        "여러 채팅방에서 함께 쓰는 공용 프리셋 추가"
+      ]
+    },
+    {
+      "version": "2.0.1.0",
+      "downloadURL": "https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp-with-firebase-v2.user.js",
+      "changes": [
+        "여러 기기 동시 업데이트를 위한 안내 기능 추가",
+        "Tampermonkey 자동 업데이트를 업데이트 안내로 대체"
+      ]
+    }
+  ]
+}
