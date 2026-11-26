@@ -4749,7 +4749,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
     }
     autoFailure(error) {
-      if (error.code === 'CANCELLED') {
+      // 떠난 방의 집계 중단은 실패가 아니며, 이미 새 방의 상태인 this.auto에 기록하지 않는다.
+      if (error.code === 'CANCELLED' || error.code === 'FRAME_CHANGED') {
         return;
       }
       const message = errorMessage(error);
@@ -4961,7 +4962,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     assertFrame(epoch, identity) {
       const route = routeIdentity();
       if (epoch !== this.routeEpoch || !route || !this.identity || identity.roomKey !== this.identity.roomKey || route.chatId !== identity.chatId || crackAccountScope() !== this.identity.accountScope) {
-        throw new SimpleRPError('방·분기·계정 또는 데이터 출처가 변경되어 이전 작업을 중단했습니다.');
+        // 사용자가 방을 옮긴 결과이므로 경로 감시·자동구축은 이 코드로 오류 알림에서 제외한다.
+        throw new SimpleRPError('방·분기·계정 또는 데이터 출처가 변경되어 이전 작업을 중단했습니다.', { code: 'FRAME_CHANGED' });
       }
     }
     queueOperation(operation) {
@@ -10413,8 +10415,11 @@ button[aria-pressed=true], .simplerp-active {
     };
     let routeSignature = '';
     let routeCheckBusy = false;
+    let routeCheckAgain = false;
     const checkRoute = async () => {
       if (routeCheckBusy) {
+        // 방을 여는 도중의 이동을 버리지 않고 현재 확인이 끝나면 한 번 더 확인한다.
+        routeCheckAgain = true;
         return;
       }
       routeCheckBusy = true;
@@ -10455,9 +10460,16 @@ button[aria-pressed=true], .simplerp-active {
           // 계정 갱신의 일시 공백은 영구적인 DB 읽기 실패와 구분한다.
           routeSignature = '';
         }
-        report(error);
+        // 여는 도중 방을 옮겨 중단된 경우는 다음 확인에서 새 방을 연다.
+        if (error?.code !== 'FRAME_CHANGED') {
+          report(error);
+        }
       } finally {
         routeCheckBusy = false;
+        if (routeCheckAgain) {
+          routeCheckAgain = false;
+          void checkRoute();
+        }
       }
     };
     ui.onRouteMismatch = checkRoute;
