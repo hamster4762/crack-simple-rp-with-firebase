@@ -1,6 +1,14 @@
 {
   "versions": [
     {
+      "version": "3.0.0.1",
+      "downloadURL": "https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js",
+      "changes": [
+        "중간에 메시지가 삭제된경우 턴수를 잘못읽는 버그 수정, 턴수집계 로직 최적화",
+        "로딩전 방이동하면 오류로 처리하는 로직 수정"
+      ]
+    },
+    {
       "version": "3.0.0.0",
       "downloadURL": "https://raw.githubusercontent.com/hamster4762/crack-simple-rp-with-firebase/refs/heads/main/crack-simple-rp.user.js",
       "changes": [

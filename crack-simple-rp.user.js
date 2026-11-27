@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SimpleRP with Firebase
 // @namespace    simplerp.with.firebase
-// @version      3.0.0.0
+// @version      3.0.0.1
 // @description  Crack 채팅의 기억을 정리하고 주입해 이야기의 연속성을 유지합니다. 로컬·Firebase 저장과 AI 기억 구축을 지원합니다. (version 관리방식: 데이터구조버전.크랙UI변경.기능추가및수정.버그수정)
 // @match        https://crack.wrtn.ai/*
 // @run-at       document-start
@@ -4014,46 +4014,90 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       complete: !['generating', 'pending', 'streaming'].includes(String(raw.status || '').toLowerCase())
     };
   }
-  function completedHistory(oldestFirst) {
-    let messages = oldestFirst.filter(row => row.adopted && row.complete);
-    if (messages.at(-1)?.turnId) {
-      // 리롤 후보는 같은 부모에서 갈라진다. 최신 완료 메시지의 부모 경로만
-      // 채택하여 현재·과거 리롤 모두 한 답변만 남긴다. UUID는 턴수가 아니다.
-      const byTurnId = new Map(messages.filter(row => row.turnId).map(row => [row.turnId, row]));
-      const selected = new Set();
-      for (let message = messages.at(-1); message && !selected.has(message.turnId); message = byTurnId.get(message.parentTurnId)) {
-        selected.add(message.turnId);
-      }
-      messages = messages.filter(row => !row.turnId || selected.has(row.turnId));
+  // Crack 목록(최신순)을 한 번만 순회하며 턴을 만든다. 각 메시지는 parentTurnId로
+  // 직전 메시지의 turnId를 가리킨다. 같은 부모의 리롤 후보는 크랙이 먼저 보여 주는
+  // 최신 응답만 남기고, 부모가 없거나 삭제되어 찾지 못하면 직전 메시지를 이전 턴으로 잇는다.
+  // USER+AI는 AI가 그 USER를 부모로 가리킬 때만 한 턴이며, 나머지 메시지는 각각 한 턴이다.
+  // 페이지마다 add()하므로 누적 목록을 다시 계산하지 않는다. keep은 보관할 최신 턴 수다.
+  class TurnCollector {
+    constructor(keep = Infinity, chain = null) {
+      this.keep = keep;
+      this.chain = chain;
+      this.newest = [];
+      this.count = 0;
+      this.last = null;
+      this.reply = null;
+      this.linked = false;
     }
-    const turns = [];
-    let pendingUser = null;
-    const append = messages => turns.push({ number: turns.length + 1, messages });
-    // USER+AI는 한 턴. 연속 AI와 답 없이 다음 USER로 넘어간 USER는 각각 한 턴.
-    for (const message of messages) {
+    push(messages) {
+      this.count += 1;
+      if (this.newest.length < this.keep) {
+        this.newest.push(messages);
+      }
+    }
+    add(message) {
+      if (!message.adopted || !message.complete) {
+        return;
+      }
+      const parent = this.last?.parentTurnId;
+      const linked = Boolean(parent) && message.turnId === parent;
+      if (!linked && parent && message.parentTurnId === parent) {
+        return;
+      }
+      this.last = message;
+      this.chain?.push(message);
+      // 빈 AI·시스템 메시지는 턴이 아니지만 부모 경로에는 포함한다.
+      this.linked &&= linked;
       if (message.role === 'user') {
-        if (pendingUser) {
-          append([pendingUser]);
+        if (this.reply && !this.linked) {
+          this.push([this.reply]);
         }
-        pendingUser = message;
+        this.push(this.reply && this.linked ? [message, this.reply] : [message]);
+        this.reply = null;
       } else if (message.role === 'assistant' && message.text.trim()) {
-        append(pendingUser ? [pendingUser, message] : [message]);
-        pendingUser = null;
+        if (this.reply) {
+          this.push([this.reply]);
+        }
+        this.reply = message;
+        this.linked = true;
       }
     }
-    if (pendingUser) {
-      append([pendingUser]);
+    // 오래된 순 턴과 전체 턴 수. 마지막 호출 뒤에는 add()하지 않는다.
+    history() {
+      if (this.reply) {
+        this.push([this.reply]);
+        this.reply = null;
+      }
+      const turns = [];
+      for (let index = this.newest.length - 1; index >= 0; index -= 1) {
+        turns.push({ number: this.count - index, messages: this.newest[index] });
+      }
+      return { turns, total: this.count };
     }
-    return { turns };
+  }
+  function completedHistory(newestFirst) {
+    const collector = new TurnCollector();
+    for (const message of newestFirst) {
+      collector.add(message);
+    }
+    return collector.history();
+  }
+  // 턴 목록의 메시지를 최신순으로 펼친다.
+  function turnMessages(turns) {
+    return turns.flatMap(turn => turn.messages).reverse();
+  }
+  // 턴 구조는 유지하고 ID가 같은 메시지만 바꾼 새 목록을 만든다.
+  function replaceMessages(turns, replacements) {
+    return turns.map(turn => ({
+      ...turn,
+      messages: turn.messages.map(message => replacements.get(message.id) || message)
+    }));
   }
   // 마지막 USER만 있는 턴은 carrier 기준에서 제외한다. 완료 턴이 하나면
   // 그 턴의 AI를 사용하고, 둘 이상이면 직전 완료 턴의 AI를 우선한다.
-  function selectCarrier(newestFirst) {
-    const turns = completedHistory([...newestFirst].reverse()).turns;
-    if (turns.at(-1)?.messages.at(-1)?.role === 'user') {
-      turns.pop();
-    }
-    for (let index = Math.max(0, turns.length - 2); index >= 0; index -= 1) {
+  function selectCarrier(turns) {
+    const end = turns.at(-1)?.messages.at(-1)?.role === 'user' ? turns.length - 1 : turns.length;
+    for (let index = Math.max(0, end - 2); index >= 0; index -= 1) {
       const assistant = turns[index]?.messages.find(message => message.role === 'assistant' && cleanAnalysisLog(message.text).trim());
       if (assistant) {
         return assistant;
@@ -4087,23 +4131,30 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     }
     clear() {
       this.rows = [];
+      this.turns = [];
       this.nextCursor = '';
       this.hasOlder = true;
       this.loaded = false;
     }
-    messages() {
-      return completedHistory([...this.rows].reverse()).turns.slice(-10)
-        .flatMap(turn => turn.messages).reverse();
+    recent() {
+      return this.turns.slice(-10);
     }
     needsOlder() {
-      const count = completedHistory([...this.rows].reverse()).turns.length;
+      const count = this.turns.length;
       // 경계의 AI 앞에 USER가 있을 수도 있으므로 열 번째 턴도 온전히 확보한다.
       return this.hasOlder && (count < 10 || count === 10 && this.rows.at(-1)?.role === 'assistant');
     }
+    // 부모 경로 밖의 리롤 후보·미완료 메시지를 버리고 턴은 변경 시에만 계산한다.
     compact() {
-      this.rows = completedHistory([...this.rows].reverse()).turns.flatMap(turn => turn.messages).reverse();
+      const collector = new TurnCollector(Infinity, []);
+      for (const message of this.rows) {
+        collector.add(message);
+      }
+      this.turns = collector.history().turns;
+      this.rows = collector.chain;
       if (this.rows.length > 22) {
         this.rows.length = 22;
+        this.turns = completedHistory(this.rows).turns;
         // 커서와 캐시 사이의 경계를 버렸으므로 그 커서를 이어 쓰지 않는다.
         this.nextCursor = null;
         this.hasOlder = true;
@@ -4206,9 +4257,13 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (!Array.isArray(data?.messages)) {
         throw new SimpleRPError('최근 메시지 배열을 확인하지 못했습니다.');
       }
-      const nextCursor = data.nextCursor == null ? '' : String(data.nextCursor);
+      if (data.messages.length && typeof data.hasNext !== 'boolean' && !Object.hasOwn(data, 'nextCursor')) {
+        throw new SimpleRPError('로그의 끝을 확인할 페이지 정보가 없습니다. 일부를 전체로 판정하지 않습니다.');
+      }
+      // 마지막 페이지(hasNext: false)에서는 cursor가 와도 더 읽지 않는다.
+      const nextCursor = data.hasNext === false || data.nextCursor == null ? '' : String(data.nextCursor);
       if (data.hasNext === true && !nextCursor) {
-        throw new SimpleRPError('남은 최근 메시지의 cursor가 없습니다.');
+        throw new SimpleRPError('남은 메시지의 cursor가 없습니다.');
       }
       const messages = data.messages.map(normalizeMessage);
       if (new Set(messages.map(message => message.id)).size !== messages.length) {
@@ -4216,92 +4271,56 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       return { messages, nextCursor };
     }
-    async recent(identity, limit = 20) {
-      const messages = [];
-      const cursors = new Set();
-      let cursor = '';
-      while (true) {
-        const page = await this.readRecentPage(identity, limit, cursor);
-        messages.push(...page.messages);
-        if (new Set(messages.map(message => message.id)).size !== messages.length) {
-          throw new SimpleRPError('최근 메시지 ID가 중복됩니다.');
-        }
-        // 보통 20개 = 완료 10턴이다. 미채택 리롤·시스템 메시지가 섞인 때만
-        // 실제 제공된 cursor로 부족한 턴을 보충한다. 검색 범위 자체는 10턴이다.
-        const next = page.nextCursor;
-        if (limit !== 20 || completedHistory([...messages].reverse()).turns.length >= 10 || !next) {
-          break;
-        }
-        if (cursors.has(next)) {
-          throw new SimpleRPError('최근 로그 cursor가 반복됩니다.');
-        }
-        cursors.add(next);
-        cursor = next;
-      }
-      if (limit === 20) {
-        const turns = completedHistory([...messages].reverse()).turns;
-        if (turns.length >= 10) {
-          const oldestMessageId = turns.at(-10).messages[0].id;
-          messages.length = messages.findIndex(message => message.id === oldestMessageId) + 1;
-        }
-      }
-      return messages;
-    }
-    async readHistory(identity, assertActive, onProgress, turnLimit = Infinity) {
-      let cursor = '';
-      const messages = [];
+    // 최신 페이지부터 읽어 collector에 순서대로 넘긴다. 페이지 경계의 중복과
+    // 반복 cursor는 거부한다. done(collector)이 참이면 남은 페이지를 읽지 않는다.
+    async readPages(identity, pageSize, collector, done, assertActive = () => {}, onPage = null) {
       const identifiers = new Set();
       const cursors = new Set();
-      const pageSize = Number.isFinite(turnLimit) ? Math.max(8, Math.min(50, (turnLimit + 1) * 2)) : 50;
-      let baseline;
-      while (true) {
+      let cursor = '';
+      do {
         assertActive();
-        // 사이트 자체와 같은 조회 경로·커서를 사용한다. 서로 다른 API의
-        // 페이지와 최신 목록을 섞어 전체 경로라고 판정하지 않는다.
-        const suffix = `${encodeURIComponent(identity.chatId)}/messages?limit=${pageSize}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
-        const payload = await this.request('GET', `https://crack-api.wrtn.ai/crack-gen/v3/chats/${suffix}`);
+        const page = await this.readRecentPage(identity, pageSize, cursor);
         assertActive();
-        const data = payload?.data || payload;
-        if (!Array.isArray(data?.messages)) {
-          throw new SimpleRPError('전체 메시지 목록 구조를 확인하지 못했습니다.');
-        }
-        for (const row of data.messages) {
-          const message = normalizeMessage(row);
+        for (const message of page.messages) {
           if (identifiers.has(message.id)) {
-            throw new SimpleRPError('페이지 경계에 중복 메시지가 있습니다. 전체 로그를 다시 읽어 주세요.');
+            throw new SimpleRPError('페이지 경계에 중복 메시지가 있습니다. 로그를 다시 읽어 주세요.');
           }
           identifiers.add(message.id);
-          messages.push(message);
+          collector.add(message);
         }
-        baseline ||= messages.slice(0, 8);
-        onProgress?.(`${displayCount(messages.length)}개 메시지 읽는 중`);
-        if (data.messages.length && typeof data.hasNext !== 'boolean' && !Object.hasOwn(data, 'nextCursor')) {
-          throw new SimpleRPError('전체 로그의 끝을 확인할 페이지 정보가 없습니다. 일부를 전체로 내보내지 않습니다.');
-        }
-        const next = data.nextCursor == null ? '' : String(data.nextCursor);
-        // 한 턴 더 읽어 선택 범위의 첫 USER 묶음이 페이지 경계에서
-        // 잘리지 않게 한다. 전체구축·최초 집계에는 턴 제한을 두지 않는다.
-        if (Number.isFinite(turnLimit) && completedHistory([...messages].reverse()).turns.length > turnLimit) {
+        onPage?.(page, identifiers.size);
+        if (done(collector)) {
           break;
         }
-        if (!next) {
-          if (data.hasNext === true) {
-            throw new SimpleRPError('남은 페이지의 cursor가 없습니다.');
-          }
-          break;
+        cursor = page.nextCursor;
+        if (cursors.has(cursor)) {
+          throw new SimpleRPError('로그 cursor가 반복됩니다.');
         }
-        if (cursors.has(next)) {
-          throw new SimpleRPError('전체 로그 cursor가 반복됩니다.');
-        }
-        cursors.add(next);
-        cursor = next;
-      }
-      const after = await this.recent(identity, 8);
-      if (!equal(baseline, after)) {
+        cursors.add(cursor);
+      } while (cursor);
+      return collector;
+    }
+    // 집계 대조용 최신 10턴. 보통 첫 페이지로 끝나며 미채택 리롤·시스템 메시지가
+    // 섞여 부족할 때만 실제 제공된 cursor로 보충한다.
+    async recent(identity) {
+      const collector = await this.readPages(identity, 20, new TurnCollector(10), read => read.count >= 10);
+      return collector.history().turns;
+    }
+    // 사이트와 같은 조회 경로·커서로 200개씩 읽는다. 턴 제한이 있으면 한 턴 더 읽어
+    // 선택 범위의 첫 USER 묶음이 경계에서 잘리지 않게 한다. 전체구축·최초 집계는 제한 없이 읽는다.
+    // collector는 TurnCollector 또는 add(message)를 가진 객체이며 그대로 반환한다.
+    async readHistory(identity, assertActive, onProgress, turnLimit = Infinity, collector = new TurnCollector()) {
+      let baseline;
+      await this.readPages(identity, 200, collector, read => read.count > turnLimit, assertActive, (page, total) => {
+        baseline ||= page.messages.slice(0, 8);
+        onProgress?.(`${displayCount(total)}개 메시지 읽는 중`);
+      });
+      const after = await this.readRecentPage(identity, 8);
+      if (!equal(baseline, after.messages)) {
         throw new SimpleRPError('전체 로그를 읽는 동안 최신 대화가 변경됐습니다. 다시 받아 주세요.');
       }
       assertActive();
-      return messages.reverse();
+      return collector;
     }
     async roomName(identity) {
       const payload = await this.request('GET', `https://crack-api.wrtn.ai/crack-gen/v3/chats/${encodeURIComponent(identity.chatId)}`);
@@ -4343,12 +4362,12 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       // 같은 직렬 작업에서 방금 읽은 carrier는 재사용한다. 그 사이 변경 신호가
       // 왔다면 해당 메시지와 문맥 변경분만 갱신한다. 제거에는 최근 목록이 필요 없다.
       const unchanged = source?.isCurrent();
-      const head = removeOnly ? [] : source
-        ? unchanged ? source.head : await source.readHead()
+      const turns = removeOnly ? [] : source
+        ? unchanged ? source.turns : await source.readTurns()
         : [];
       const fresh = unchanged ? source.fresh : await this.readMessage(identity, messageId);
       assertActive();
-      assertInjectionNotNewer([fresh, ...head], savedUpdatedAt);
+      assertInjectionNotNewer([fresh, ...turnMessages(turns)], savedUpdatedAt);
       if (removeOnly) {
         // 최신 서버 원문에서 자신의 블록만 제거한다. 사전 단건 GET을 중복하지
         // 않으며 사용자 편집·다른 확프의 내용은 이 원문 그대로 보존한다.
@@ -4366,7 +4385,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       const removalOnly = stripOwnBlock(expected, removeOnly && savedUpdatedAt === null);
       const removingOwnBlock = removalOnly.found && removalOnly.text === next;
-      if (!removingOwnBlock && selectCarrier(head)?.id !== messageId) {
+      if (!removingOwnBlock && selectCarrier(turns)?.id !== messageId) {
         throw new SimpleRPError('주입 대상 턴이 변경됐습니다. 최신 대화로 다시 준비하세요.');
       }
       assertActive();
@@ -4692,9 +4711,10 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
               throw new SimpleRPError('집계 중 대화가 변경됐습니다.', { code: 'CANCELLED' });
             }
           };
-          const history = completedHistory(await this.adapter.readHistory(identity, assertActive));
+          // 집계에는 턴 수와 최근 10턴만 필요하므로 원문 전체를 보관하지 않는다.
+          const history = (await this.adapter.readHistory(identity, assertActive, null, Infinity, new TurnCollector(10))).history();
           assertActive();
-          this.turnCountCache = { total: history.turns.length, recent: this.countMarkers(history.turns) };
+          this.turnCountCache = { total: history.total, recent: this.countMarkers(history.turns) };
         }
         const target = (this.currentRoomCache?.lastBuild.lastTurn || 0) + this.settings.autoBuildPeriod;
         this.auto.observedTotal = this.turnCountCache.total;
@@ -4729,7 +4749,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
     }
     autoFailure(error) {
-      if (error.code === 'CANCELLED') {
+      // 떠난 방의 집계 중단은 실패가 아니며, 이미 새 방의 상태인 this.auto에 기록하지 않는다.
+      if (error.code === 'CANCELLED' || error.code === 'FRAME_CHANGED') {
         return;
       }
       const message = errorMessage(error);
@@ -4800,12 +4821,12 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         assertActive();
         if (!this.turnCountCache && !prepared) {
           const sequence = this.messageChangeSequence;
-          const history = completedHistory(await this.adapter.readHistory(identity, () => {
+          const history = (await this.adapter.readHistory(identity, () => {
             assertActive();
             if (sequence !== this.messageChangeSequence) {
               throw new SimpleRPError('로그 수집 중 대화가 변경됐습니다. 바로실행에서 다시 확인하세요.');
             }
-          }));
+          })).history();
           this.turnCountCache = { total: history.turns.length, recent: this.countMarkers(history.turns) };
           prepared = { history, lastTurn: history.turns.length, assertActive };
         }
@@ -4825,7 +4846,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           }
         };
         prepared?.assertActive();
-        let history = prepared?.history || completedHistory(await this.adapter.readHistory(identity, checkReading, null, needed + skip));
+        let history = prepared?.history || (await this.adapter.readHistory(identity, checkReading, null, needed + skip)).history();
         checkReading();
         let selected = history.turns.slice(-(needed + skip), skip ? -skip : undefined);
         if (selected.length !== needed) {
@@ -4866,7 +4887,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         let candidate = applyMemoryPacket(before, packet);
         await new SchemaValidator().room(candidate);
         const capacity = () => {
-          const carrier = selectCarrier(this.messageCache.messages());
+          const carrier = selectCarrier(this.messageCache.recent());
           return selectInjection(roomWithPresets(candidate, this.currentPresets), this.recentTurns, '', carrier ? stripOwnBlock(carrier.text).text : '');
         };
         if (capacity().over) {
@@ -4941,7 +4962,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
     assertFrame(epoch, identity) {
       const route = routeIdentity();
       if (epoch !== this.routeEpoch || !route || !this.identity || identity.roomKey !== this.identity.roomKey || route.chatId !== identity.chatId || crackAccountScope() !== this.identity.accountScope) {
-        throw new SimpleRPError('방·분기·계정 또는 데이터 출처가 변경되어 이전 작업을 중단했습니다.');
+        // 사용자가 방을 옮긴 결과이므로 경로 감시·자동구축은 이 코드로 오류 알림에서 제외한다.
+        throw new SimpleRPError('방·분기·계정 또는 데이터 출처가 변경되어 이전 작업을 중단했습니다.', { code: 'FRAME_CHANGED' });
       }
     }
     queueOperation(operation) {
@@ -5033,7 +5055,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           this.messageChanges.delete(key);
         }
       }
-      return cache.messages();
+      return cache.recent();
     }
     async activateRoute() {
       const route = routeIdentity();
@@ -5408,13 +5430,14 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       const sequence = this.messageChangeSequence;
       let headRead = false;
       try {
-        const head = await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
+        const turns = await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
         this.assertFrame(epoch, identity);
+        const head = turnMessages(turns);
         if (this.currentRoomCache) {
           assertInjectionNotNewer(head, this.injectionRoom.meta.updatedAt);
         }
         if (sequence === this.messageChangeSequence) {
-          this.updateTurnCount(head);
+          this.updateTurnCount(turns);
         }
         headRead = true;
         this.injection.unknown = false;
@@ -5422,7 +5445,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         const changed = signature !== this.lastHead;
         this.lastHead = signature;
         if (changed || recover) {
-          this.recentTurns = completedHistory([...head].reverse()).turns;
+          this.recentTurns = turns;
         }
         if (this.adapter.generation?.chatId === identity.chatId) {
           const latest = head.find(message => message.role === 'assistant' && message.complete && message.adopted);
@@ -5469,7 +5492,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           this.injection.error = '저장된 방 기억 없이 SimpleRP 주입이 남아 있습니다. ! 버튼으로 해제할 수 있습니다. 다른 기기에서 넣은 주입도 해제될 수 있습니다.';
           this.injection.carrierId = own[0].id;
         }
-        const stable = selectCarrier(head);
+        const stable = selectCarrier(turns);
         const needsReconcile = this.injection.intent && Boolean(this.currentRoomCache) && !this.adapter.generation &&
           (recover || changed || Boolean(this.injection.error));
         if (!needsReconcile && this.injection.intent && this.currentRoomCache && !this.adapter.generation && !this.injection.error) {
@@ -5581,19 +5604,19 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           // 최근 목록은 이벤트가 알려 준 변경분만 갱신한다. carrier의 실제 원문은
           // 별도 단건 GET으로 확인하며, 그 결과를 같은 작업의 PATCH에도 사용한다.
           const headSequence = this.messageChangeSequence;
-          const head = await this.readRecentContext(assertActive);
+          const recentTurns = await this.readRecentContext(assertActive);
           assertActive();
-          assertInjectionNotNewer(head, saved.meta.updatedAt);
-          const carrier = selectCarrier(head);
+          assertInjectionNotNewer(turnMessages(recentTurns), saved.meta.updatedAt);
+          const carrier = selectCarrier(recentTurns);
           if (!carrier) {
             throw new SimpleRPError('주입할 AI 메시지가 없습니다. AI 응답이 완료된 뒤 다시 시작하세요.');
           }
           const fresh = await this.adapter.readMessage(identity, carrier.id);
           assertActive();
           assertInjectionNotNewer([fresh], saved.meta.updatedAt);
-          head[head.findIndex(message => message.id === carrier.id)] = fresh;
+          const turns = replaceMessages(recentTurns, new Map([[carrier.id, fresh]]));
+          const head = turnMessages(turns);
           const stripped = stripOwnBlock(fresh.text);
-          const turns = completedHistory([...head].reverse()).turns;
           const selection = selectInjection(saved, turns, pendingUser, stripped.text);
           if (selection.over) {
             // 필수 내용 초과만 1회 경고. 자동 후보는 정책 변경 없이 용량 선별한다.
@@ -5618,9 +5641,9 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
             raw = fresh.text;
           } else {
             raw = await this.adapter.patchVerified(identity, carrier.id, fresh.text, selection.raw, assertActive, false, saved.meta.updatedAt, {
-              fresh, head,
+              fresh, turns,
               isCurrent: () => headSequence === this.messageChangeSequence && !this.messageChanges.size,
-              readHead: () => this.readRecentContext(assertActive)
+              readTurns: () => this.readRecentContext(assertActive)
             });
           }
           // 새 carrier 먼저 검증, 이전 자신의 블록 정리. 타 확프 블록은 보존.
@@ -5652,17 +5675,17 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
               this.messageCache.update(messageId, { ...message, text });
             }
           }
-          const confirmedHead = head.map(message => ({
-            ...message,
-            text: confirmedTexts.get(message.id) ?? message.text
-          }));
+          // confirmedTexts에는 이번 문맥(head)에 있는 메시지만 들어 있다.
+          const confirmedTurns = replaceMessages(turns, new Map([...confirmedTexts].map(([messageId, text]) => [
+            messageId, { ...head.find(row => row.id === messageId), text }
+          ])));
           // 자체 PATCH를 다음 대화 변경으로 오인하지 않도록 확인된 원문을 함께 반영한다.
           // 도중 새 이벤트를 반영한 캐시까지 처리한 척하지 않고 이번 선택의 기준만 기록한다.
-          this.lastHead = JSON.stringify(confirmedHead.map(message => [message.id, message.text, message.complete, message.role, message.adopted]));
+          this.lastHead = JSON.stringify(turnMessages(confirmedTurns).map(message => [message.id, message.text, message.complete, message.role, message.adopted]));
           if (headSequence === this.messageChangeSequence) {
-            this.updateTurnCount(head);
+            this.updateTurnCount(turns);
           }
-          this.recentTurns = completedHistory([...confirmedHead].reverse()).turns;
+          this.recentTurns = confirmedTurns;
           this.preview = selection;
           this.injection = {
             phase: 'ON',
@@ -5677,7 +5700,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           // 이번에 읽은 문맥에 PATCH 성공한 수정 원문까지 반영한 목록만 반환한다.
           // 도중에 변경 신호가 있었으면 전송 준비에서 새로 조회한다.
           return headSequence === this.messageChangeSequence
-            ? { head: confirmedHead, sequence: headSequence } : null;
+            ? { turns: confirmedTurns, sequence: headSequence } : null;
         } catch (error) {
           if (epoch === this.routeEpoch && !this.blockNewerInjection(error)) {
             this.injection.phase = 'OFF';
@@ -5720,7 +5743,14 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         this.injection.phase = 'PENDING';
         this.paint();
         try {
-          const head = await this.adapter.readHistory(identity, assertActive);
+          // 리롤 후보를 포함한 모든 메시지에서 블록을 찾으므로 턴으로 묶지 않고 모은다.
+          const { rows: head } = await this.adapter.readHistory(identity, assertActive, null, Infinity, {
+            count: 0,
+            rows: [],
+            add(message) {
+              this.rows.push(message);
+            }
+          });
           assertActive();
           await this.removeBlocks(identity, head, assertActive, savedUpdatedAt);
           // 각 블록의 PATCH 성공으로 완료 판정. 전체 기록 재조회 없음.
@@ -5733,9 +5763,8 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
             error: ''
           };
           this.knownCarrierIds.clear();
-          const recent = this.messageCache.messages();
-          this.recentTurns = completedHistory([...recent].reverse()).turns;
-          const carrier = selectCarrier(recent);
+          this.recentTurns = this.messageCache.recent();
+          const carrier = selectCarrier(this.recentTurns);
           // 해제로 갱신한 캐시에서 후보를 복구한다. 추가 서버 조회는 하지 않는다.
           this.preview = carrier && this.currentRoomCache
             ? selectInjection(this.injectionRoom, this.recentTurns, '', stripOwnBlock(carrier.text).text)
@@ -5778,9 +5807,9 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (this.injection.intent && this.currentRoomCache) {
         let pending = text;
         if (frame.event === 'reroll') {
-          const head = await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
+          const turns = await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
           this.assertFrame(epoch, identity);
-          pending = head.find(message => message.role === 'user')?.text || '';
+          pending = turnMessages(turns).find(message => message.role === 'user')?.text || '';
         }
         reconciled = await this.reconcile('before-send', pending);
         this.assertFrame(epoch, identity);
@@ -5788,12 +5817,13 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
           throw new SimpleRPError('주입 확인 전에는 전송하지 않습니다.');
         }
       }
-      const head = reconciled?.sequence === this.messageChangeSequence
-        ? reconciled.head : await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
+      const turns = reconciled?.sequence === this.messageChangeSequence
+        ? reconciled.turns : await this.queueOperation(() => this.readRecentContext(() => this.assertFrame(epoch, identity)));
       this.assertFrame(epoch, identity);
+      const frontier = turnMessages(turns).find(message => message.role === 'assistant');
       return {
-        frontier: head.find(message => message.role === 'assistant')?.id || '',
-        frontierText: head.find(message => message.role === 'assistant')?.text || ''
+        frontier: frontier?.id || '',
+        frontierText: frontier?.text || ''
       };
     }
     scheduleRefresh() {
@@ -5820,12 +5850,12 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
         messageIds: turn.messages.map(message => message.id)
       }));
     }
-    updateTurnCount(newestFirst) {
+    updateTurnCount(turns) {
       const cached = this.turnCountCache;
       if (!cached) {
         return;
       }
-      const recent = this.countMarkers(completedHistory([...newestFirst].reverse()).turns);
+      const recent = this.countMarkers(turns);
       const shared = recent.findLast(turn => cached.recent.some(old => old.endId === turn.endId));
       if (!shared) {
         this.turnCountCache = null;
@@ -5864,10 +5894,10 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       }
       let history = null;
       if (forceFull || !this.turnCountCache) {
-        history = completedHistory(await this.adapter.readHistory(identity, assertActive, onProgress));
+        history = (await this.adapter.readHistory(identity, assertActive, onProgress)).history();
         assertActive();
         this.turnCountCache = {
-          total: history.turns.length,
+          total: history.total,
           recent: this.countMarkers(history.turns)
         };
       }
@@ -5900,7 +5930,7 @@ format, schemaVersion, sourceUpdatedAt, lastTurn, memory만 가진 JSON 객체 �
       if (mode === 'continue' && (!Number.isInteger(count) || count < 1 || count > lastTurn)) {
         throw new SimpleRPError(`최신 로그 수는 1~${lastTurn}턴이어야 합니다.`);
       }
-      const history = prepared.history || completedHistory(await this.adapter.readHistory(identity, prepared.assertActive, onProgress, count));
+      const history = prepared.history || (await this.adapter.readHistory(identity, prepared.assertActive, onProgress, count)).history();
       prepared.assertActive();
       const selected = mode === 'continue' ? history.turns.slice(-count) : history.turns;
       if (mode === 'continue' && selected.length !== count) {
@@ -10385,8 +10415,11 @@ button[aria-pressed=true], .simplerp-active {
     };
     let routeSignature = '';
     let routeCheckBusy = false;
+    let routeCheckAgain = false;
     const checkRoute = async () => {
       if (routeCheckBusy) {
+        // 방을 여는 도중의 이동을 버리지 않고 현재 확인이 끝나면 한 번 더 확인한다.
+        routeCheckAgain = true;
         return;
       }
       routeCheckBusy = true;
@@ -10427,9 +10460,16 @@ button[aria-pressed=true], .simplerp-active {
           // 계정 갱신의 일시 공백은 영구적인 DB 읽기 실패와 구분한다.
           routeSignature = '';
         }
-        report(error);
+        // 여는 도중 방을 옮겨 중단된 경우는 다음 확인에서 새 방을 연다.
+        if (error?.code !== 'FRAME_CHANGED') {
+          report(error);
+        }
       } finally {
         routeCheckBusy = false;
+        if (routeCheckAgain) {
+          routeCheckAgain = false;
+          void checkRoute();
+        }
       }
     };
     ui.onRouteMismatch = checkRoute;
